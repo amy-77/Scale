@@ -15,8 +15,9 @@
   ``partition_kernels.py``；
 * Merge 的调度在 ``partition_gpu.merge_sync_nonoverlap``，真正的 cost、
   matching、compact Triton 算子也在 ``partition_kernels.py``；
-* 名字虽然叫 raw-FP8 builder，但当前实现仍会短暂物化 ``[N,128]`` FP32 K，
-  只是避免了旧路径的 ``[128,N]`` 转置和完整 ``[128,N+1]`` FP64 prefix。
+* 名字虽然叫 raw-FP8 builder，但 CUDA 默认路径现在直接从 ``K_fp8 + scale``
+  计算 SSE 和叶子 ``sum(K)``，不再物化 ``[N,128]`` FP32 K 或完整 FP64 prefix。
+  CPU / FP32 moment 仍保留物化 fallback。
 
 环境变量 ``SGLANG_NSA_ADAPTIVE_HISA_RAW_FP8_BUILDER=1`` 开启此路径。
 FP64 moment 下叶子划分应与旧 ``key_values`` 路径一致；FP32 moment 需要单独
@@ -29,7 +30,6 @@ import os
 import torch
 
 from sglang.srt.layers.attention.nsa.adaptive_hisa.partition_gpu import TreeLayout
-from sglang.srt.layers.attention.nsa.adaptive_hisa.summary_kernels import requant_summaries
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -50,7 +50,7 @@ def _moment_dtype() -> torch.dtype:
 def dequant_keys_fp32(k_fp8: torch.Tensor, k_scale: torch.Tensor, n: int) -> torch.Tensor:
     """将前 ``n`` 个 FP8 K 反量化成行主序 ``[n,128]`` FP32。
 
-    这里就是当前实现仍然会产生 ``[N,128]`` FP32 临时量的位置。
+    只给 CPU 和 FP32 moment fallback 使用；CUDA FP64 路径不调用它。
     """
     if k_fp8.dtype == torch.uint8:
         k_fp8 = k_fp8.view(torch.float8_e4m3fn)
@@ -76,42 +76,45 @@ def build_key_tree_from_fp8(
 
     ``SSE = sum_d(moment_sq[d] - moment[d]² / token_count)``。
 
-    相邻两个子节点只需把 moment 相加，就能得到父节点，因此按
-    ``atom → 2*atom → ... → root`` 自底向上建树。
-
-    返回：
-
-    * ``flat[n_nodes]``：所有节点的 FP64 SSE，按 level-major 排列；
-    * ``layout``：各层节点数量、偏移和 token 长度。
-
-    注意：这段当前是 PyTorch tensor 运算，不是
-    ``partition_kernels._score_tree_kernel``。
+    CUDA + FP64 走 Triton：每个 root 在寄存器中累计 moment，只把 SSE 树写回。
+    FP32 实验或 CPU fallback 才使用下方 PyTorch 实现。
     """
     if root % atom or (root // atom) & (root // atom - 1):
         raise ValueError("root/atom must be a power of two")
     if n_complete % root:
         raise ValueError(f"sealed length {n_complete} is not a multiple of root {root}")
     layout = TreeLayout(atom, root, n_complete)
+    if (
+        _moment_dtype() == torch.float64
+        and k_fp8.is_cuda
+        and k_fp8.shape[1] == 128
+    ):
+        from sglang.srt.layers.attention.nsa.adaptive_hisa import partition_kernels as _pk
+
+        if _pk.use_triton(k_fp8) and layout.levels > 1:
+            return _pk.raw_fp8_tree_triton(k_fp8, k_scale, layout), layout
+    return _build_key_tree_torch(k_fp8, k_scale, layout), layout
+
+
+def _build_key_tree_torch(
+    k_fp8: torch.Tensor, k_scale: torch.Tensor, layout: TreeLayout
+) -> torch.Tensor:
+    """CPU/FP32 reference. Materializes dequantized keys; not the CUDA path."""
     dtype = _moment_dtype()
-    # 只处理可被 root 整除的 sealed prefix，尾部留给 raw tail。
-    keys = dequant_keys_fp32(k_fp8, k_scale, n_complete)  # [N, D]
-    # 第一级：每个 atom 的 sum(K) 与 sum(K²)，shape=[n_atoms,D]。
-    grouped = keys.reshape(layout.n_atoms, atom, keys.shape[1]).to(dtype)
+    keys = dequant_keys_fp32(k_fp8, k_scale, layout.n_tokens)  # [N, D]
+    grouped = keys.reshape(layout.n_atoms, layout.atom, keys.shape[1]).to(dtype)
     moment = grouped.sum(dim=1)
     moment_sq = grouped.square().sum(dim=1)
     del keys, grouped
-    count = float(atom)
+    count = float(layout.atom)
     energies = []
     for lv in range(layout.levels):
-        # 这行就是 P-key / Key-SSE 的核心公式。
         energies.append((moment_sq - moment.square() / count).sum(-1))
         if lv + 1 < layout.levels:
-            # 两个相邻子节点合并成父节点；moment 可以直接相加。
             moment = moment[0::2] + moment[1::2]
             moment_sq = moment_sq[0::2] + moment_sq[1::2]
             count *= 2.0
-    flat = torch.cat(energies).to(torch.float64)
-    return flat, layout
+    return torch.cat(energies).to(torch.float64)
 
 
 def leaf_totals_from_fp8(
@@ -123,9 +126,20 @@ def leaf_totals_from_fp8(
 ) -> torch.Tensor:
     """计算每个叶子的 ``sum(K)``，返回 ``[M,128]`` FP64。
 
-    Merge 的 Ward cost 和最终 summary 都需要叶子总和。这里沿 token 维建立
-    ``[N+1,128]`` prefix，再用 ``prefix[end]-prefix[start]`` 取区间和。
+    CUDA + FP64 按叶子分段累加，不建立 ``[N,128]`` 或 ``[N+1,128]`` 中间量。
     """
+    if (
+        _moment_dtype() == torch.float64
+        and k_fp8.is_cuda
+        and k_fp8.shape[1] == 128
+        and leaf_start.is_cuda
+    ):
+        from sglang.srt.layers.attention.nsa.adaptive_hisa import partition_kernels as _pk
+
+        if _pk.use_triton(k_fp8):
+            return _pk.leaf_totals_fp8_triton(
+                k_fp8, k_scale, leaf_start, leaf_len, n_complete
+            )
     keys = dequant_keys_fp32(k_fp8, k_scale, n_complete)
     dtype = _moment_dtype()
     prefix = torch.zeros((n_complete + 1, keys.shape[1]), dtype=dtype, device=keys.device)
@@ -140,11 +154,10 @@ def summaries_from_totals(
     leaf_len: torch.Tensor,
     scale_fmt: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """把最终叶子的 ``sum(K)`` 转成 ``mean(K)``，再量化为 FP8 summary。"""
-    denom = leaf_len.to(totals.dtype).clamp_min(1).unsqueeze(-1)
-    means = (totals / denom).to(torch.float32)
-    means = torch.where(leaf_len.unsqueeze(-1) > 0, means, torch.zeros_like(means))
-    return requant_summaries(means, scale_fmt)
+    """把最终叶子的 ``sum(K)`` 直接量化为 FP8 summary。"""
+    from sglang.srt.layers.attention.nsa.adaptive_hisa.summary_kernels import requant_from_totals
+
+    return requant_from_totals(totals, leaf_len, scale_fmt)
 
 
 def build_partition_from_fp8(
@@ -171,7 +184,7 @@ def build_partition_from_fp8(
     """
     from sglang.srt.layers.attention.nsa.adaptive_hisa.partition_gpu import (
         GpuPartition,
-        dp_leaf_mask,
+        dp_leaf_and_gain,
         emit_leaves,
         merge_sync_nonoverlap,
         repair_leaves,
@@ -234,16 +247,17 @@ def build_partition_from_fp8(
     # dp_leaf_mask 最终会进入：
     #   _dp_leaf_mask_kernel
     # ------------------------------------------------------------------
-    lam, _count0, rounds = search_lambda(
-        flat, layout, budget, candidates=cfg.lambda_candidates, rel_tol=cfg.lambda_rel_tol
+    lam, _count0, rounds, rounds_used = search_lambda(
+        flat, layout, budget, candidates=cfg.lambda_candidates, rel_tol=cfg.lambda_rel_tol,
+        max_rounds=cfg.lambda_max_rounds, deficit_tol=cfg.lambda_deficit_tol,
     )
-    is_leaf = dp_leaf_mask(flat, layout, lam)
+    is_leaf, leaf_gain = dp_leaf_and_gain(flat, layout, lam)
     dp_leaves = is_leaf.sum()
     t2 = _mark(device, profile)
     # λ-DP 通常只保证叶子数 <= budget。repair 按 split gain 从大到小继续切，
-    # 直到恰好 budget=L/8；关键 kernel 是 _gain_kernel/_staircase_kernel。
+    # 直到恰好 budget=L/8；fused gain 避免再次扫描 flat。
     is_leaf, repairs, passes = repair_leaves(
-        flat, layout, is_leaf, budget, tie_passes=cfg.repair_tie_passes
+        flat, layout, is_leaf, budget, tie_passes=cfg.repair_tie_passes, gain=leaf_gain
     )
     num_leaves = is_leaf.sum()
     status_ok = num_leaves == budget
@@ -284,6 +298,7 @@ def build_partition_from_fp8(
     meta = dict(base_meta)
     meta.update({
         "lambda_rounds": rounds,
+        "lambda_rounds_used": rounds_used,  # device int64 (early stop)
         "lambda_candidates": cfg.lambda_candidates,
         "repair_passes": passes,
     })

@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 import torch
 
 from sglang.srt.layers.attention.nsa.adaptive_hisa import partition_kernels as _pk
+from sglang.srt.layers.attention.nsa.adaptive_hisa import partition_select as _sel
 from sglang.srt.layers.attention.nsa.adaptive_hisa.config import PartitionConfig
 from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_partition import (
     PrefillPartition,
@@ -221,9 +222,20 @@ def dp_counts(flat: torch.Tensor, layout: TreeLayout, lams: torch.Tensor) -> tor
 
 def dp_leaf_mask(flat: torch.Tensor, layout: TreeLayout, lam: torch.Tensor) -> torch.Tensor:
     """用最终 λ 重新跑 DP，并从 root 向下生成扁平叶子 mask。"""
+    leaf, _gain = dp_leaf_and_gain(flat, layout, lam)
+    return leaf
+
+
+def dp_leaf_and_gain(
+    flat: torch.Tensor, layout: TreeLayout, lam: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """One fused traversal when Triton is available; gain is ``None`` on fallback."""
     if layout.levels > 1 and _pk.use_triton(flat):
-        return _pk.dp_leaf_mask_triton(flat, layout, lam)
-    lam = lam.to(torch.float64).reshape(())
+        return _pk.dp_leaf_and_gain_triton(flat, layout, lam)
+    return _dp_leaf_mask_torch(flat, layout, lam), None
+
+
+def _dp_leaf_mask_torch(flat: torch.Tensor, layout: TreeLayout, lam: torch.Tensor) -> torch.Tensor:
     cost = flat[layout.slice(0)] + lam
     do_split = [torch.zeros(layout.size(0), dtype=torch.bool, device=flat.device)]
     for lv in range(1, layout.levels):
@@ -248,11 +260,17 @@ def search_lambda(
     *,
     candidates: int,
     rel_tol: float,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+    max_rounds: int = 0,
+    deficit_tol: float = -1.0,
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
     """搜索使 ``leaf_count <= M`` 的最小 λ。
 
     λ 越大，每个叶子的惩罚越大，算法越倾向保留粗节点，因此叶子越少。
-    返回 ``(lambda, count_at_zero, rounds)``，所有标量留在 device 上。
+    轮数由 ``rel_tol``（区间相对宽度）决定，``max_rounds > 0`` 可再加上限。
+    ``deficit_tol >= 0`` 打开按叶子数的 device 侧提前收敛：一旦可行端 ``hi``
+    的 DP 叶子数满足 ``M - count <= deficit_tol * M``，剩余轮次立即返回
+    （launch 数不变，省掉整棵树的 DP），差额交给 exact repair。
+    返回 ``(lambda, count_at_zero, rounds, rounds_used)``，标量留在 device 上。
     """
     device = flat.device
     root_energy = flat[layout.slice(layout.levels - 1)]
@@ -262,23 +280,41 @@ def search_lambda(
     zero_ok = count0 <= m_leaves
     k = int(candidates)
     rounds = max(1, math.ceil(math.log(1.0 / rel_tol) / math.log(k + 1)))
+    if max_rounds > 0:
+        rounds = min(rounds, int(max_rounds))
+    tol_leaves = int(math.floor(deficit_tol * m_leaves)) if deficit_tol >= 0 else -1
+    # hi >= 2*max root SSE + 1 exceeds every split gain, so no root is split.
+    hi_count = torch.full((), float(layout.n_roots), dtype=torch.float64, device=device)
     if layout.levels > 1 and _pk.use_triton(flat) and k & (k - 1) == 0:
-        bracket = torch.stack((lo, hi))
-        _pk.search_rounds_triton(flat, layout, bracket, m_leaves, candidates=k, rounds=rounds)
+        zero = torch.zeros((), dtype=torch.float64, device=device)
+        bracket = torch.stack((lo, hi, hi_count, zero, zero))
+        _pk.search_rounds_triton(
+            flat, layout, bracket, m_leaves, candidates=k, rounds=rounds, deficit_tol=tol_leaves
+        )
         best = torch.where(zero_ok, lo, bracket[1])
-        return best, count0, rounds
+        return best, count0, rounds, bracket[4].to(torch.int64)
     frac = torch.arange(1, k + 1, dtype=torch.float64, device=device) / (k + 1)
+    done = torch.zeros((), dtype=torch.bool, device=device)
+    used = torch.zeros((), dtype=torch.int64, device=device)
     for _ in range(rounds):
         cands = lo + (hi - lo) * frac
         # counts are monotone in λ, so feasibility is a suffix of the grid:
         # grid = [lo, c_1..c_K, hi]; with n feasible candidates the first
         # feasible point is grid[K - n + 1] and the last infeasible grid[K - n].
-        n_feasible = (dp_counts(flat, layout, cands) <= m_leaves).sum()
+        counts = dp_counts(flat, layout, cands)
+        n_feasible = (counts <= m_leaves).sum()
         grid = torch.cat((lo.reshape(1), cands, hi.reshape(1)))
         idx = (k - n_feasible).reshape(1)
-        lo, hi = grid[idx][0], grid[idx + 1][0]
+        cgrid = torch.cat((counts.to(torch.float64), hi_count.reshape(1)))
+        new_lo, new_hi, new_count = grid[idx][0], grid[idx + 1][0], cgrid[idx][0]
+        lo = torch.where(done, lo, new_lo)
+        hi = torch.where(done, hi, new_hi)
+        hi_count = torch.where(done, hi_count, new_count)
+        used = used + (~done).to(torch.int64)
+        if tol_leaves >= 0:
+            done = done | (m_leaves - hi_count <= tol_leaves)
     best = torch.where(zero_ok, lo * 0.0, hi)
-    return best, count0, rounds
+    return best, count0, rounds, used
 
 
 # --------------------------------------------------------------------------- #
@@ -444,16 +480,16 @@ def repair_leaves(
     m_leaves: int,
     *,
     tie_passes: str | int = "auto",
+    gain: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """按最大 split gain 继续切分，直到叶子数恰好等于 ``m_leaves``。
 
-    λ-DP 只保证 ``count <= M``；这里计算
-    ``gain = parent_sse - left_sse - right_sse``，优先切 gain 最大的叶子。
-    整个 repair 无 host read，并通过 staircase 顺序一次选出 deficit 个节点。
+    ``gain`` 可由 fused leaf-mask kernel 传入，避免再次读取整棵 SSE 树。
     """
     device = flat.device
     statics = layout_statics(layout, device)
-    gain, _ = _node_keys(flat, layout)
+    if gain is None:
+        gain, _ = _node_keys(flat, layout)
     deficit = m_leaves - is_leaf.sum()
     frontier = is_leaf.clone()
     frontier[layout.slice(0)] = False
@@ -467,6 +503,14 @@ def repair_leaves(
     bits = max(1, int(layout.n_nodes + 1).bit_length())
     if layout.levels > 1 and _pk.use_triton(flat) and bits * _pk.STAIR_PER <= 63:
         packed, reach = _pk.staircase_keys_triton(rank, frontier, layout, bits)
+        if _sel.available(packed):
+            # Pop the `deficit` lexicographically smallest reachable keys by
+            # exact radix *selection*: keys are unique per reachable node, so
+            # "<= k-th smallest" is exactly the first `deficit` of the sorted
+            # order, without sorting (and re-permuting) 3 int64 arrays.
+            popped = _sel.lex_select_mask(packed, reach, deficit, key_bits=bits * _pk.STAIR_PER)
+            new_leaf = (is_leaf & ~popped) | (_children_mask(popped, layout) & ~popped)
+            return new_leaf, popped.sum(), 1
         keys = [packed[:, k] for k in range(packed.shape[1])]
     else:
         stairs, reach = _staircase(rank, frontier, layout)
@@ -580,6 +624,9 @@ def kth_cost_threshold(cost: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     no host sync and it captures into a CUDA graph.
     """
     k = k.to(torch.int64).reshape(())
+    if _sel.available(cost):
+        # exact radix selection: one scalar written, no sorted copy in HBM
+        return _sel.kth_threshold_f64(cost, k).reshape(())
     kth = torch.sort(cost).values.gather(0, (k - 1).clamp(0, cost.shape[0] - 1).reshape(1)).reshape(())
     inf = torch.full((), float("inf"), dtype=torch.float64, device=cost.device)
     return torch.where(k > 0, torch.nextafter(kth, inf), -inf)
@@ -622,24 +669,34 @@ def merge_sync_nonoverlap(
     per_round = []
     if _pk.use_triton(start) and capacity >= 2:
         ws: dict = {}
+        # Row means (totals / len) travel with the rows: computed once here and
+        # then by the compact kernel, so the cost kernel never divides.
+        means = _pk.row_means(totals, length)
         for _ in range(int(rounds)):
             if target is None:
-                start, length, totals, count, n_sel = _pk.merge_round_triton(
+                start, length, totals, means, count, n_sel = _pk.merge_round_triton(
                     start, length, totals, count, threshold,
-                    max_merge_len=max_merge_len, n_tokens=n_tokens, workspace=ws,
+                    max_merge_len=max_merge_len, n_tokens=n_tokens, workspace=ws, means=means,
                 )
             else:
                 deficit = merge_deficit(count, target, capacity - 1)
                 cost = _pk.merge_costs_triton(
-                    length, totals, count, max_merge_len=max_merge_len, workspace=ws, active=deficit > 0
+                    length, means, count, max_merge_len=max_merge_len, workspace=ws, active=deficit > 0
                 )
                 thr = kth_cost_threshold(cost, (deficit * TARGET_ADMIT_FACTOR).clamp_max(capacity - 1))
-                start, length, totals, count, n_sel = _pk.merge_round_triton(
+                start, length, totals, means, count, n_sel = _pk.merge_round_triton(
                     start, length, totals, count, thr,
                     max_merge_len=max_merge_len, n_tokens=n_tokens, workspace=ws,
-                    ecost=cost, cap_merges=deficit,
+                    means=means, ecost=cost, cap_merges=deficit,
                 )
             per_round.append(n_sel)
+        # The compact kernel only writes live rows (no per-round tail padding
+        # traffic); normalise the tail once here so consumers see the usual
+        # (start=n_tokens, len=0, totals=0) padding.
+        live = torch.arange(capacity, device=device) < count
+        start = torch.where(live, start, torch.full_like(start, n_tokens))
+        length = torch.where(live, length, torch.zeros_like(length))
+        totals = torch.where(live[:, None], totals, torch.zeros_like(totals))
         return start, length, count, totals, per_round
     rows = torch.arange(capacity, device=device)
     edge_pos = torch.arange(capacity - 1, device=device)
@@ -803,11 +860,7 @@ def build_partition_gpu(
     *,
     profile: bool = False,
 ) -> GpuPartition:
-    """普通 ``[128,N]`` GPU 路径的 Split+Merge 总入口。
-
-    raw-FP8 路径使用 ``pkey_fp8_builder.build_partition_from_fp8``，但两条路径
-    共用本文件的 λ 搜索、leaf mask、repair 和 merge 调度。
-    """
+    """Split (+merge) the sealed prefix of ``scores[C, >=N_complete]`` on the device."""
     n_tokens = int(n_tokens)
     if scores.dim() != 2:
         raise ValueError(f"scores must be [C,N], got {tuple(scores.shape)}")
@@ -848,14 +901,15 @@ def build_partition_gpu(
     if not layout.n_roots <= budget <= layout.n_atoms:
         raise ValueError(f"M={budget} infeasible: roots={layout.n_roots}, atoms={layout.n_atoms}")
     t1 = _mark(device, profile)
-    lam, _count0, rounds = search_lambda(
-        flat, layout, budget, candidates=cfg.lambda_candidates, rel_tol=cfg.lambda_rel_tol
+    lam, _count0, rounds, rounds_used = search_lambda(
+        flat, layout, budget, candidates=cfg.lambda_candidates, rel_tol=cfg.lambda_rel_tol,
+        max_rounds=cfg.lambda_max_rounds, deficit_tol=cfg.lambda_deficit_tol,
     )
-    is_leaf = dp_leaf_mask(flat, layout, lam)
+    is_leaf, leaf_gain = dp_leaf_and_gain(flat, layout, lam)
     dp_leaves = is_leaf.sum()
     t2 = _mark(device, profile)
     is_leaf, repairs, passes = repair_leaves(
-        flat, layout, is_leaf, budget, tie_passes=cfg.repair_tie_passes
+        flat, layout, is_leaf, budget, tie_passes=cfg.repair_tie_passes, gain=leaf_gain
     )
     num_leaves = is_leaf.sum()
     status_ok = num_leaves == budget
@@ -882,7 +936,12 @@ def build_partition_gpu(
     if profile:
         events = {"tree_s": (t0, t1), "dp_s": (t1, t2), "repair_s": (t2, t3), "merge_s": (t3, t4), "total_s": (t0, t4)}
     meta = dict(base_meta)
-    meta.update({"lambda_rounds": rounds, "lambda_candidates": cfg.lambda_candidates, "repair_passes": passes})
+    meta.update({
+        "lambda_rounds": rounds,
+        "lambda_rounds_used": rounds_used,  # device int64 (early stop)
+        "lambda_candidates": cfg.lambda_candidates,
+        "repair_passes": passes,
+    })
     # After target merge, only ~L/D rows are live; shrink storage from M0=L/8 so
     # the summary pool and decode workspace stop carrying 7/8 padding.
     storage = budget
