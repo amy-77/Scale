@@ -1,0 +1,32 @@
+ M python/sglang/srt/layers/attention/nsa/headmap_probe.py
+ M python/sglang/srt/layers/attention/nsa/nsa_indexer.py
+ M python/sglang/srt/managers/schedule_batch.py
+ M python/sglang/srt/mem_cache/memory_pool.py
+ M python/sglang/srt/model_executor/cuda_graph_runner.py
+ M python/sglang/srt/model_executor/forward_batch_info.py
+ M python/sglang/srt/models/deepseek_v2.py
+ M scripts/run_group16_all64_router.sh
+?? adaptive_hisa_code_20260919.tar.gz
+?? adaptive_hisa_share.tar.gz
+?? docs/research/adaptive_hisa.md
+?? docs/research/adaptive_hisa_decode.md
+?? docs/research/adaptive_hisa_phase_b_acceptance.md
+?? docs/research/adaptive_hisa_runtime_audit.md
+?? docs/research/official_dsa_eval_on_other_machine.md
+?? python/sglang/srt/layers/attention/nsa/adaptive_hisa/
+?? python/sglang/srt/layers/attention/nsa/headmap_probe.py.pre128k
+?? python/sglang/srt/layers/attention/nsa/hisa/csrc/hisa_topk_fused.cu
+?? python/sglang/srt/layers/attention/nsa/hisa/hisa_topk_fused.py
+?? python/sglang/srt/layers/attention/nsa/hisa/indexer.py
+?? python/sglang/srt/layers/attention/nsa/hisa/tilelang_kernels.py
+?? python/sglang/srt/layers/attention/nsa/hisa/triton_kernels.py
+?? python/sglang/srt/layers/attention/nsa/indexer_dump.py
+?? scripts/analyze_chunk_selector_ablation.py
+?? scripts/analyze_exact_indexer_ablation.py
+?? scripts/analyze_static_group16_selected_mass.py
+?? scripts/build_exact_indexer_ablation_subset.py
+?? scripts/build_ruler_regression_subset.py
+?? scripts/collect_indexer_dump.py
+?? scripts/run_indexer_dump.sh
+?? test/registered/unit/test_adaptive_hisa_decode.py
+?? test/registered/unit/test_adaptive_hisa_prefill_partition.py
