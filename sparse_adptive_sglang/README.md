@@ -1,4 +1,4 @@
-# Adaptive-HISA 稀疏 Prefill — `adaptive_0921_h202`（代码快照 2026-09-21）
+# Adaptive-HISA 稀疏 Prefill — `adaptive_0921_h202`（代码快照 2026-09-21 23:50）
 
 来源机器 h20-9-57，目录 `/DATA/disk0/qyl/code/adaptive_0921_h202`。
 基线：https://github.com/xuyufei-a/sglang_hisa 分支 `hisa_pr`，git HEAD `faa198b4e`（`git_head.txt`）；
@@ -29,7 +29,8 @@
 |---|---|---|
 | 总入口 | `nsa/adaptive_hisa/pkey_fp8_builder.py : build_partition_from_fp8` | 一次完整的 P-key 建树 → split → merge，输出 `leaf_start/leaf_len/num_leaves` 和 `_merge_totals`；CUDA graph 捕获的对象 |
 | 建树（FP8 直接） | `nsa/adaptive_hisa/partition_kernels.py : _raw_fp8_score_tree_kernel`（Triton） | 由 FP8 key + scale 直接算每个树节点的 SSE 得分（fp64） |
-| 建树（分块版） | `partition_kernels.py : _fp8_chunk_tree_kernel`, `_fp8_upper_tree_kernel` | 行分块建树，上层节点合并 |
+| 建树（分块版） | `partition_kernels.py : _fp8_chunk_tree_kernel`, `_fp8_upper_tree_kernel` | 行分块建树，上层节点合并；带 `c0`/`r0` 偏移，可只对新增 root 启动 |
+| 建树（跨 chunk 增量，**新**） | `partition_kernels.py : raw_fp8_tree_triton_incremental`, `_tree_copy_levels_kernel`；缓存 `prefill_runtime.py : _TreeCache`（`TREE_CACHE=1`） | chunked prefill 下复用上一 chunk 的 SSE 树：旧前缀各 level 拷入新树，只为新增 root 读 FP8 K 建节点；与整棵重建逐位相同（128K 1.19 → 0.10 ms）；λ/Split/Merge 仍在整棵树上做 |
 | λ 搜索 | `nsa/adaptive_hisa/partition_gpu.py : search_lambda` → `partition_kernels.py : search_rounds_triton` → `_dp_count_reduce_kernel`（KC=8, num_warps=1）, `_dp_count_bracket_kernel`, `_bracket_update_kernel`, `_bracket_from_totals_kernel` | 二分搜 λ 使叶子数 ≤ L/8；上限 `lambda_max_rounds=6` |
 | DP 叶子标记 | `partition_kernels.py : _dp_leaf_mask_kernel`, `_dp_leaf_gain_kernel` | 在给定 λ 下标记叶子并算 split gain |
 | 补叶子 | `partition_gpu.py : repair_leaves` → `partition_kernels.py : _staircase_kernel` | 按最大 gain 把叶子数补到恰好 L/8 |
@@ -49,9 +50,9 @@
 |---|---|---|
 | 准入 | `prefill_select.py : sparse_prefill_admission` | B=1、非 capture/spec/CP/PP、entry epoch 匹配、`budget ≤ n_complete ≤ chunk_start`、非 fused Top-K；最后 chunk 按 `DENSE_FINAL / FINAL_CANDIDATES` 处理 |
 | 粗筛 | `prefill_select.py : coarse_leaf_scores` → `deep_gemm.fp8_mqa_logits(q, summaries)` | `[n_q, capacity]` summary logits；padding/空叶子 −inf；起点在 `[0, sink)` 的叶子 +inf 强制排第一 |
-| 排序 | `prefill_select.py : rank_leaves`（`torch.argsort` + `cumsum`） | 每行叶子降序 + 叶长前缀和 |
-| 展开 | `prefill_select.py : expand_candidates` → `_expand_slots_kernel`（Triton） | 每行 `budget` 个 slot 在前缀和上二分找到所在叶子，写出 token id；跨预算叶子自动截断 |
-| 精排（叶子候选） | `nsa/hisa/triton_kernels.py : sparse_paged_mqa_triton`（K=1） | 对候选 token 在 paged index-K cache 上算精确 fp8 logits |
+| 选叶 + 展开（**新，默认**） | `prefill_select.py : select_candidates_weighted` → `nsa/adaptive_hisa/csrc/prefill_weighted_select.cu : batched_weighted_select_kernel` | 每个 query 行一个 CTA：decode `weighted_select` 的 token 加权 4 轮 radix 阈值搜索批量化，直接写出被选叶的连续 token 区间（可选输出 `(start,len,offset)` 段）；2.0 → 0.5 ms/chunk，结果与旧路径一致 |
+| 排序 + 展开（旧，`PREFILL_SELECT=argsort`） | `prefill_select.py : rank_leaves`（`torch.argsort` + `cumsum`）→ `expand_candidates` → `_expand_slots_kernel`（Triton） | 每行叶子降序 + 叶长前缀和；每个 slot 二分找所在叶子写 token id |
+| 精排（叶子候选，**新**） | `prefill_select.py : _fine_scores` → `nsa/hisa/triton_kernels.py : block_sparse_mqa_triton(kv_block_size=1)`（`_block_sparse_mqa_persistent_kernel`） | 有 flat index-K 时用 HISA 持久化 kernel：一个 CTA 负责一行 2048 个候选 token id，Q 只读一次，gather 与 GEMM 流水；249 TFLOPS（H20 fp8 峰值 84%）。无 flat K 时退回 `sparse_paged_mqa_triton(K=1)` |
 | 精排（局部窗口） | `prefill_select.py : _local_keys` + `deep_gemm.fp8_mqa_logits`（`ke` 逐行因果） | 因果局部窗口 `[n_complete, pos]` 连续，用密集 kernel 打分后 `cat` |
 | Top-2048 | `nsa/hisa/hisa_topk_fused.py : hisa_topk_candidates_fused` | 输出 request-relative token id，格式同 `fast_topk_v2(..., row_starts=ks)` |
 | 核心编排 | `prefill_select.py : sparse_topk_core`（可独立测试）、`sparse_prefill_topk`（服务内包装） | 行按 `SPARSE_PREFILL_ROWS` 分批，全程无 `.item()` |
@@ -87,9 +88,9 @@ scheduler 组 batch
     │                  ├─ wait_event(entry.ready_event)                                  （等 side stream 上的分区建完）
     │                  ├─ summary_pool.SummaryPool.read(entry)  → summaries fp8 [cap,128] + scale
     │                  └─ sparse_topk_core(q, w, seq_lens, raw_pages, block_table, summaries, leaf_start/len, ...)
-    │                       coarse_leaf_scores → rank_leaves → 按 2048 行分批 {
-    │                         expand_candidates(_expand_slots_kernel)
-    │                         sparse_paged_mqa_triton(K=1)         ← 叶子候选精排
+    │                       coarse_leaf_scores → 按 2048 行分批 {
+    │                         select_candidates_weighted(batched_weighted_select_kernel)   ← 选叶 + 展开
+    │                         _fine_scores → block_sparse_mqa_triton(K=1, flat index-K)  ← 叶子候选精排
     │                         deep_gemm.fp8_mqa_logits(局部窗口)   ← [n_complete, pos] 精排
     │                         hisa_topk_candidates_fused           ← Top-2048
     │                       }
@@ -98,8 +99,8 @@ scheduler 组 batch
     │                └─ prefill_runtime.schedule_prefill_partition
     │                     ├─ prepare_prefill_partition   （cfg.sparse_prefill 时中间 chunk 也准入；n_complete = floor(seq_len/256)·256）
     │                     └─ _schedule_key_partition → _build_gpu_raw_fp8   （side stream，CUDA graph）
-    │                          ├─ pkey_fp8_builder.build_partition_from_fp8(k_fp8[:n_complete], k_scale, ...)
-    │                          │    build_key_tree_from_fp8 → search_lambda → dp_leaf_and_gain → repair_leaves
+    │                          ├─ pkey_fp8_builder.build_partition_from_fp8(k_fp8[:n_complete], k_scale, ..., tree_cache=TREES.get(...))
+    │                          │    build_key_tree_from_fp8（有缓存 → raw_fp8_tree_triton_incremental）→ search_lambda → dp_leaf_and_gain → repair_leaves
     │                          │    → emit_leaves → leaf_totals_from_fp8 → merge_sync_nonoverlap
     │                          ├─ summaries_from_totals(_merge_totals, leaf_len)  → FP8 summary
     │                          ├─ summary_pool.allocate(layer, req, epoch, part) + 写页    （释放同 (layer, req) 的上一版）
@@ -123,6 +124,8 @@ decode（与 h201 相同）
 | `SPARSE_PREFILL_CANDIDATES` | 0 | prefill 叶子 token 预算（0 = 沿用 decode 的 `CANDIDATE_TOKENS`=8192） |
 | `SPARSE_PREFILL_FINAL_CANDIDATES` | 0 | 只给最后一个 chunk 用的预算 |
 | `SPARSE_PREFILL_DENSE_FINAL` | 0 | 最后一个 chunk 保留官方密集 DSA indexer（中间 chunk 仍稀疏） |
+| `PREFILL_SELECT` | weighted | 选叶算子：`weighted`（batched radix select）/ `argsort`（旧路径，A/B 用） |
+| `TREE_CACHE` | 1 | 跨 chunk 增量 Key-SSE 树（0 = 每 chunk 整棵重建） |
 
 ## 结果（128K，8×H20 TP8，DeepSeek-V3.2）
 
@@ -133,7 +136,14 @@ decode（与 h201 相同）
 | DSA 官方 | 68.4 s | 20.3 ms |
 | HISA-64（固定块，prefill+decode 两级） | 38.4 s | 17.8 ms |
 | h201 adaptive，仅 decode 稀疏 | 68.9 s | 19.2 ms |
-| h202 稀疏 prefill（单请求，无 graph） | 56.3 s | – |
+| h202 稀疏 prefill（全 chunk 稀疏，argsort 选叶） | 47.13 s | 19.2 ms |
+| h202 + dense final | 50.80 s | 19.2 ms |
+| h202 + weighted radix select（09-21 22:xx） | 46.12 s | 19.3 ms |
+| **h202 + flat 持久化精排 + 增量 SSE 树（09-21 23:xx，当前代码）** | **45.44 s** | 19.2 ms |
+
+128K 最后一个 chunk、每层稀疏 indexer 各阶段（H20）：coarse GEMM 1.3 + 选叶 0.5 + 精排 4.4 + 局部窗口密集 GEMM 2.4 + cat/Top-2048 2.1 ≈ 10.7 ms
+（精排、局部窗口都已到 fp8 算力上限；HISA 自己的 K=64 块 kernel 处理同样 token 反而慢 6%），side stream 上每 chunk 建分区 4.7 ms（merge 8 轮 2.7 ms 占大头）。
+分阶段数据、微基准脚本和进一步的优化清单见 `delta/docs_research/speed_bench_128k_20260921.md` 与 `runner/speed_bench_20260921/`。
 
 精度（arm `sparse_prefill`：全 chunk 稀疏，预算 8192，sink 64；与 h201 同一 held-out）：
 
@@ -161,9 +171,10 @@ decode（与 h201 相同）
     SGLANG_NSA_ADAPTIVE_HISA_RAW_FP8_BUILDER=1  SGLANG_NSA_ADAPTIVE_HISA_GPU_STREAM=side
     SGLANG_NSA_ADAPTIVE_HISA_SINK=64  SGLANG_NSA_ADAPTIVE_HISA_TAIL=256  SGLANG_NSA_ADAPTIVE_HISA_CANDIDATE_TOKENS=8192
     SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL=1  [SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_DENSE_FINAL=1]
+    [SGLANG_NSA_ADAPTIVE_HISA_PREFILL_SELECT=weighted  SGLANG_NSA_ADAPTIVE_HISA_TREE_CACHE=1]   # 默认值
     SGLANG_NSA_FUSE_TOPK=0
 
 服务参数：`--chunked-prefill-size 8192 --max-running-requests 1 --disable-radix-cache`。
 到第三个 chunk 起日志应出现 `adaptive-hisa sparse prefill layer=... final=...`。
 
-单测（GPU）：`PYTHONPATH=python python -m pytest delta/test/registered/unit/test_adaptive_hisa_sparse_prefill.py -q`
+单测（GPU）：`PYTHONPATH=python python -m pytest delta/test/registered/unit/test_adaptive_hisa_{sparse_prefill,prefill_partition,decode}.py -q`（61 passed）

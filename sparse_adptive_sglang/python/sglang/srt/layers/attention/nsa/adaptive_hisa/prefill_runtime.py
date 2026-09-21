@@ -248,6 +248,8 @@ class PreparedPartition:
     epoch: int
     n_tokens: int
     n_complete: int
+    # 最后一个 prefill chunk：之后不会再扩展这棵树。
+    final: bool = False
 
 
 @dataclass
@@ -274,7 +276,54 @@ class BuildContext:
     token_to_kv_pool: object | None = None
 
 
+class _TreeCache:
+    """上一个 prefill chunk 的 Key-SSE 树，按 ``(layer, req)`` 保存。
+
+    sealed prefix 内的 dyadic 节点在更长前缀的树里不变，所以下一个 chunk 只需
+    为新增 root 建节点（``raw_fp8_tree_triton_incremental``）。条目带 epoch，
+    请求槽复用后旧树不会被误用；``release_request`` 时释放。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._trees: dict[tuple[int, int], tuple[int, int, torch.Tensor]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, layer_id: int, req_idx: int, epoch: int, n_complete: int):
+        """返回 ``(flat, n_old)``；没有可扩展的严格前缀树时返回 ``None``。"""
+        key = (int(layer_id), int(req_idx))
+        with self._lock:
+            hit = self._trees.get(key)
+        if hit is None or hit[0] != epoch or not 0 < hit[1] < n_complete:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return hit[2], hit[1]
+
+    def put(self, layer_id: int, req_idx: int, epoch: int, n_complete: int, flat: torch.Tensor) -> None:
+        key = (int(layer_id), int(req_idx))
+        with self._lock:
+            self._trees[key] = (int(epoch), int(n_complete), flat)
+
+    def drop(self, layer_id: int, req_idx: int) -> None:
+        with self._lock:
+            self._trees.pop((int(layer_id), int(req_idx)), None)
+
+    def release(self, req_idx: int) -> None:
+        req_idx = int(req_idx)
+        with self._lock:
+            for key in [key for key in self._trees if key[1] == req_idx]:
+                del self._trees[key]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._trees.clear()
+        self.hits = self.misses = 0
+
+
 STATE = _RequestEpoch()
+TREES = _TreeCache()
 _STREAM: torch.cuda.Stream | None = None
 _WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="adaptive-hisa-partition")
 _PENDING: list[Future] = []
@@ -302,6 +351,7 @@ def reset_prefill_state() -> None:
     global _STREAM
     finish_prefill_partitions()
     STATE.clear()
+    TREES.clear()
     _STREAM = None
     import sys
 
@@ -322,6 +372,7 @@ def release_request(req_idx: int) -> None:
     epoch 递增后，即使旧构建稍后完成，``STATE.put`` 也会拒绝写回旧请求槽。
     """
     STATE.release(req_idx)
+    TREES.release(req_idx)
     import sys
 
     decode = sys.modules.get(__package__ + ".decode_runtime")
@@ -437,6 +488,7 @@ def prepare_prefill_partition(
             STATE.epoch(req_idx),
             n_tokens,
             n_complete_tokens(n_tokens, cfg.root),
+            bool(final[0]),
         )
     except Exception:
         logger.exception("adaptive-hisa failed to prepare prefill partition")
@@ -577,9 +629,28 @@ def _build_gpu_raw_fp8(
         if side is not None:
             k_fp8.record_stream(side)
             k_scale.record_stream(side)
+        tree_cache = None
+        if cfg.tree_cache:
+            tree_cache = TREES.get(
+                prepared.layer_id, prepared.req_idx, prepared.epoch, prepared.n_complete
+            )
         part = build_partition_from_fp8(
-            k_fp8, k_scale, prepared.n_tokens, cfg, profile=cfg.profile
+            k_fp8, k_scale, prepared.n_tokens, cfg, profile=cfg.profile, tree_cache=tree_cache
         )
+        flat = part.meta.pop("_tree_flat", None)
+        if prepared.final:
+            # 最后一个 chunk：这棵树不会再被扩展，立刻释放（16 B/token/层）。
+            TREES.drop(prepared.layer_id, prepared.req_idx)
+        elif cfg.tree_cache and flat is not None and part.n_complete:
+            TREES.put(prepared.layer_id, prepared.req_idx, prepared.epoch, part.n_complete, flat)
+        part.meta["tree_incremental"] = tree_cache is not None
+        if tree_cache is not None and TREES.hits == 1:
+            logger.info(
+                "adaptive-hisa incremental Key-SSE tree: layer=%d req=%d prefix %d -> %d tokens "
+                "(only the %d new roots are built)",
+                prepared.layer_id, prepared.req_idx, int(tree_cache[1]), part.n_complete,
+                (part.n_complete - int(tree_cache[1])) // cfg.root,
+            )
         part.meta["layer_id"] = prepared.layer_id
         part.meta["req_idx"] = prepared.req_idx
         part.meta["stream"] = "side" if side is not None else "main"

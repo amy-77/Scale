@@ -154,6 +154,10 @@ class PartitionConfig:
     # and replay it for every layer of the request (host cost per layer drops
     # from ~200 launches to one replay). Falls back to eager if capture fails.
     graph_build: bool = True
+    # raw-fp8 builder: keep each (layer, request)'s Key-SSE tree between prefill
+    # chunks and only add the nodes of the newly sealed roots (the prefix's
+    # dyadic nodes are unchanged); λ/Split/Merge still run on the full tree.
+    tree_cache: bool = True
     # gpu backend: "main" runs the build in-stream (its GPU time lands on the
     # critical path of the last chunk: +0.14 s at 32K); "side" issues it on a
     # second stream that waits on the scores and is joined at forward end, so
@@ -161,7 +165,34 @@ class PartitionConfig:
     # overlap baseline). Overlap depends on SM headroom; GPU_STREAM=main reverts.
     gpu_stream: str = "side"
     cpu_overlap: bool = False
+    # Adaptive sparse prefill: every prefill chunk builds the partition of its
+    # sealed prefix (not only the final chunk), and the next chunk's indexer
+    # scores summaries first, expands the best leaves to ``candidate_tokens``
+    # raw tokens, adds the causal local window, and takes Top-2048 from that
+    # candidate set instead of the dense ``[n_q, N]`` DSA logits.
+    sparse_prefill: bool = False
+    # Query rows per sparse-prefill sub-batch (bounds the candidate/logit
+    # workspaces: rows x (candidate_tokens + chunk) x 8 bytes).
+    sparse_prefill_rows: int = 2048
+    # Raw-token leaf budget for the prefill two-level selection; 0 = use
+    # ``candidate_tokens`` (the decode budget). Prefill amortises the fine
+    # pass over 8192 query rows, so a larger budget is cheap there: on a 128K
+    # dump 16384 lifts Top-2048 recall 0.886 -> 0.945 for ~+16 ms/layer-chunk.
+    sparse_prefill_candidates: int = 0
+    # The final prompt chunk produces the first output token (RULER NIAH is
+    # decided there). ``dense_final`` keeps the dense DSA indexer for that chunk;
+    # ``final_candidates`` (0 = same as prefill budget) gives it a larger budget.
+    sparse_prefill_dense_final: bool = False
+    sparse_prefill_final_candidates: int = 0
     profile: bool = False
+
+    @property
+    def prefill_candidate_tokens(self) -> int:
+        return self.sparse_prefill_candidates or self.candidate_tokens
+
+    @property
+    def final_candidate_tokens(self) -> int:
+        return self.sparse_prefill_final_candidates or self.prefill_candidate_tokens
 
     # ------------------------------------------------------------------ #
     @property
@@ -277,6 +308,14 @@ class PartitionConfig:
             raise PartitionConfigError(f"GPU_STREAM must be one of {GPU_STREAMS}, got {self.gpu_stream!r}")
         if self.gpu_stream == "side" and self.split_backend != "gpu":
             raise PartitionConfigError("GPU_STREAM=side only applies to SPLIT_BACKEND=gpu")
+        if self.sparse_prefill and (self.split_backend != "gpu" or not self.build_summaries):
+            raise PartitionConfigError("SPARSE_PREFILL requires GPU partitions and FP8 summaries")
+        if self.sparse_prefill_rows < 1:
+            raise PartitionConfigError("SPARSE_PREFILL_ROWS must be positive")
+        for name in ("sparse_prefill_candidates", "sparse_prefill_final_candidates"):
+            v = getattr(self, name)
+            if v < 0 or v % 256:
+                raise PartitionConfigError(f"{name.upper()} must be 0 or a positive multiple of 256")
         if self.enabled:
             _refuse_conflicting_experiments()
         return self
@@ -294,9 +333,12 @@ class PartitionConfig:
             f"max_merge_len={self.max_merge_len or 'none'} "
             f"merge_target={('L/%d@%d' % (self.merge_target_divisor, self.merge_target_rounds)) if self.merge_target_divisor else 'off'} "
             f"summaries={self.build_summaries} "
-            f"graph_build={self.graph_build} gpu_stream={self.gpu_stream} cpu_overlap={self.cpu_overlap} "
+            f"graph_build={self.graph_build} tree_cache={self.tree_cache} gpu_stream={self.gpu_stream} cpu_overlap={self.cpu_overlap} "
             f"fallback_layers={self.fallback_layers} candidate_tokens={self.candidate_tokens} "
-            f"sink={self.sink_tokens} tail={self.tail_tokens} decode_chunk={self.decode_chunk}"
+            f"sink={self.sink_tokens} tail={self.tail_tokens} decode_chunk={self.decode_chunk} "
+            f"sparse_prefill={self.sparse_prefill}@{self.sparse_prefill_rows}rows"
+            f"/{self.prefill_candidate_tokens}cand"
+            f"/final={'dense' if self.sparse_prefill_dense_final else self.final_candidate_tokens}"
         )
 
 
@@ -408,6 +450,24 @@ def config_from_env() -> PartitionConfig:
     raw = _env("GRAPH_BUILD")
     if raw is not None:
         updates["graph_build"] = _parse_bool("GRAPH_BUILD", raw)
+    raw = _env("TREE_CACHE")
+    if raw is not None:
+        updates["tree_cache"] = _parse_bool("TREE_CACHE", raw)
+    raw = _env("SPARSE_PREFILL")
+    if raw is not None:
+        updates["sparse_prefill"] = _parse_bool("SPARSE_PREFILL", raw)
+    raw = _env("SPARSE_PREFILL_ROWS")
+    if raw:
+        updates["sparse_prefill_rows"] = int(raw)
+    raw = _env("SPARSE_PREFILL_CANDIDATES")
+    if raw:
+        updates["sparse_prefill_candidates"] = int(raw)
+    raw = _env("SPARSE_PREFILL_FINAL_CANDIDATES")
+    if raw:
+        updates["sparse_prefill_final_candidates"] = int(raw)
+    raw = _env("SPARSE_PREFILL_DENSE_FINAL")
+    if raw is not None:
+        updates["sparse_prefill_dense_final"] = _parse_bool("SPARSE_PREFILL_DENSE_FINAL", raw)
     raw = _env("GPU_STREAM")
     if raw is not None:
         updates["gpu_stream"] = raw.lower()

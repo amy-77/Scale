@@ -65,6 +65,7 @@ def build_key_tree_from_fp8(
     *,
     atom: int,
     root: int,
+    tree_cache: tuple[torch.Tensor, int] | None = None,
 ) -> tuple[torch.Tensor, TreeLayout]:
     """计算所有 dyadic 区间的 Key-SSE 能量树。
 
@@ -78,6 +79,13 @@ def build_key_tree_from_fp8(
 
     CUDA + FP64 走 Triton：每个 root 在寄存器中累计 moment，只把 SSE 树写回。
     FP32 实验或 CPU fallback 才使用下方 PyTorch 实现。
+
+    ``tree_cache=(flat_old, n_old)`` 是同一请求、同一层上一个 chunk 建好的树
+    （sealed prefix ``[0, n_old)``）。dyadic 节点不跨 root，所以旧前缀内每个
+    节点的 SSE 在更长前缀的树里完全不变：只复制旧层、只为新增 root
+    ``[n_old, n_complete)`` 读 FP8 K 建节点（``raw_fp8_tree_triton_incremental``）。
+    结果与整棵重建逐位相同；随后的 λ 搜索 / Split / Merge 仍在整棵树上做，
+    因为 M0、λ 和 merge target 都随前缀长度变化，旧 partition 不能复用。
     """
     if root % atom or (root // atom) & (root // atom - 1):
         raise ValueError("root/atom must be a power of two")
@@ -92,6 +100,14 @@ def build_key_tree_from_fp8(
         from sglang.srt.layers.attention.nsa.adaptive_hisa import partition_kernels as _pk
 
         if _pk.use_triton(k_fp8) and layout.levels > 1:
+            if tree_cache is not None:
+                flat_old, n_old = tree_cache
+                return (
+                    _pk.raw_fp8_tree_triton_incremental(
+                        k_fp8, k_scale, layout, flat_old, int(n_old)
+                    ),
+                    layout,
+                )
             return _pk.raw_fp8_tree_triton(k_fp8, k_scale, layout), layout
     return _build_key_tree_torch(k_fp8, k_scale, layout), layout
 
@@ -167,8 +183,13 @@ def build_partition_from_fp8(
     cfg,
     *,
     profile: bool = False,
+    tree_cache: tuple[torch.Tensor, int] | None = None,
 ):
     """完整执行一次 P-key ``建树 → Split → Merge``。
+
+    ``tree_cache=(flat_old, n_old)``：上一个 chunk 同层的 SSE 树，见
+    :func:`build_key_tree_from_fp8`。本次的树放在 ``part.meta["_tree_flat"]``
+    供下一个 chunk 复用。
 
     这是本文件最重要的总入口。调用关系如下：
 
@@ -234,7 +255,7 @@ def build_partition_from_fp8(
     # ------------------------------------------------------------------
     t0 = _mark(device, profile)
     flat, layout = build_key_tree_from_fp8(
-        k_fp8, k_scale, done, atom=cfg.atom, root=cfg.root
+        k_fp8, k_scale, done, atom=cfg.atom, root=cfg.root, tree_cache=tree_cache
     )
     t1 = _mark(device, profile)
     if not layout.n_roots <= budget <= layout.n_atoms:
@@ -331,4 +352,6 @@ def build_partition_from_fp8(
     if finals is not None:
         # 最终叶子的 sum(K) 直接交给 summary writer，避免再次扫描 raw K。
         part.meta["_merge_totals"] = finals
+    # 下一个 chunk 只需为新增 root 建节点（prefill_runtime 负责按请求缓存）。
+    part.meta["_tree_flat"] = flat
     return part

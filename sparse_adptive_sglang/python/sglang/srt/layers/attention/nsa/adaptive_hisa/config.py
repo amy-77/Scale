@@ -154,6 +154,10 @@ class PartitionConfig:
     # and replay it for every layer of the request (host cost per layer drops
     # from ~200 launches to one replay). Falls back to eager if capture fails.
     graph_build: bool = True
+    # raw-fp8 builder: keep each (layer, request)'s Key-SSE tree between prefill
+    # chunks and only add the nodes of the newly sealed roots (the prefix's
+    # dyadic nodes are unchanged); λ/Split/Merge still run on the full tree.
+    tree_cache: bool = True
     # gpu backend: "main" runs the build in-stream (its GPU time lands on the
     # critical path of the last chunk: +0.14 s at 32K); "side" issues it on a
     # second stream that waits on the scores and is joined at forward end, so
@@ -329,7 +333,7 @@ class PartitionConfig:
             f"max_merge_len={self.max_merge_len or 'none'} "
             f"merge_target={('L/%d@%d' % (self.merge_target_divisor, self.merge_target_rounds)) if self.merge_target_divisor else 'off'} "
             f"summaries={self.build_summaries} "
-            f"graph_build={self.graph_build} gpu_stream={self.gpu_stream} cpu_overlap={self.cpu_overlap} "
+            f"graph_build={self.graph_build} tree_cache={self.tree_cache} gpu_stream={self.gpu_stream} cpu_overlap={self.cpu_overlap} "
             f"fallback_layers={self.fallback_layers} candidate_tokens={self.candidate_tokens} "
             f"sink={self.sink_tokens} tail={self.tail_tokens} decode_chunk={self.decode_chunk} "
             f"sparse_prefill={self.sparse_prefill}@{self.sparse_prefill_rows}rows"
@@ -446,6 +450,9 @@ def config_from_env() -> PartitionConfig:
     raw = _env("GRAPH_BUILD")
     if raw is not None:
         updates["graph_build"] = _parse_bool("GRAPH_BUILD", raw)
+    raw = _env("TREE_CACHE")
+    if raw is not None:
+        updates["tree_cache"] = _parse_bool("TREE_CACHE", raw)
     raw = _env("SPARSE_PREFILL")
     if raw is not None:
         updates["sparse_prefill"] = _parse_bool("SPARSE_PREFILL", raw)

@@ -5,6 +5,9 @@
 * ``_fp8_chunk_tree_kernel``：每 16 token 一个 program，反量化后的
   ``[16,128]`` fp64 tile 留在寄存器里逐层归约，只写出 chunk 的两个 ``[D]`` 矩；
 * ``_fp8_upper_tree_kernel``：每棵 root 一个 program，归约 16 个 chunk 矩得到上层节点；
+  两者都带 chunk/root 偏移（``c0``/``r0``），chunked prefill 下
+  ``raw_fp8_tree_triton_incremental`` 只为新增 root 建节点，旧前缀各 level 由
+  ``_tree_copy_levels_kernel`` 拷入新树（结果与整棵重建逐位相同）；
 * ``_leaf_totals_fp8_kernel``：按叶子分段求 ``sum(K)``，不落地 ``[N,D]`` / prefix。
 
 Split 核心：
@@ -236,14 +239,15 @@ if HAS_TRITON:
             tl.store(flat_ptr + off + r * (R >> l) + j, e)
             off += n_roots * (R >> l)
 
-    @triton.jit(do_not_specialize=["n_roots", "n_tokens"])
+    @triton.jit(do_not_specialize=["n_roots", "n_tokens", "c0"])
     def _fp8_chunk_tree_kernel(
         k_ptr,  # fp8 [N, D], row-major
         scale_ptr,  # fp32 [N]
         flat_ptr,  # fp64 [n_nodes] out, level-major (levels 0..log2(CA))
-        mom_ptr,  # fp64 [n_chunks, 2, D] out: chunk sum(K), sum(K^2)
+        mom_ptr,  # fp64 [n_chunks - c0, 2, D] out: chunk sum(K), sum(K^2)
         n_roots,
         n_tokens,
+        c0,  # first chunk handled by this launch (incremental tree: old roots kept)
         ATOM: tl.constexpr,
         R: tl.constexpr,
         CA: tl.constexpr,  # atoms per chunk (power of two, <= R)
@@ -256,8 +260,12 @@ if HAS_TRITON:
         thread at 4 warps) stays in registers; SSE for every node inside the
         chunk is reduced pairwise from register moments and only the chunk's
         two ``[D]`` moment vectors leave the SM.
+
+        Node positions use the full tree (``n_roots``); ``c0 > 0`` fills only
+        chunks ``[c0, c0 + grid)`` (the sealed prefix's nodes are copied from
+        the previous chunk's tree) and stores moments relative to ``c0``.
         """
-        c = tl.program_id(0)
+        c = c0 + tl.program_id(0)
         i = tl.arange(0, CA)
         a = tl.arange(0, ATOM)
         d = tl.arange(0, D)
@@ -291,14 +299,15 @@ if HAS_TRITON:
             j = tl.arange(0, (CA >> l))
             tl.store(flat_ptr + off + c * (CA >> l) + j, e)
             off += n_roots * (R >> l)
-        tl.store(mom_ptr + (c * 2) * D + d, tl.reshape(m, (D,)))
-        tl.store(mom_ptr + (c * 2 + 1) * D + d, tl.reshape(m2, (D,)))
+        tl.store(mom_ptr + ((c - c0) * 2) * D + d, tl.reshape(m, (D,)))
+        tl.store(mom_ptr + ((c - c0) * 2 + 1) * D + d, tl.reshape(m2, (D,)))
 
-    @triton.jit(do_not_specialize=["n_roots"])
+    @triton.jit(do_not_specialize=["n_roots", "r0"])
     def _fp8_upper_tree_kernel(
-        mom_ptr,  # fp64 [n_chunks, 2, D]
+        mom_ptr,  # fp64 [n_chunks - r0 * NC, 2, D]
         flat_ptr,  # fp64 [n_nodes] out (levels log2(CA)+1 .. LEVELS-1)
         n_roots,
+        r0,  # first root handled by this launch (moments are relative to it)
         ATOM: tl.constexpr,
         R: tl.constexpr,
         CA: tl.constexpr,
@@ -308,10 +317,10 @@ if HAS_TRITON:
     ):
         """Stage 2: one root per program, reduces its ``R/CA`` chunk moments."""
         NC: tl.constexpr = R // CA
-        r = tl.program_id(0)
+        r = r0 + tl.program_id(0)
         q = tl.arange(0, NC)
         d = tl.arange(0, D)
-        base = (r * NC + q)[:, None] * (2 * D) + d[None, :]
+        base = ((r - r0) * NC + q)[:, None] * (2 * D) + d[None, :]
         m = tl.load(mom_ptr + base)
         m2 = tl.load(mom_ptr + base + D)
         cnt = (CA * ATOM) * 1.0
@@ -325,6 +334,36 @@ if HAS_TRITON:
             j = tl.arange(0, (NC >> l2))
             tl.store(flat_ptr + off + r * (NC >> l2) + j, e)
             off += n_roots * (NC >> l2)
+
+    @triton.jit(do_not_specialize=["n_old", "n_new"])
+    def _tree_copy_levels_kernel(
+        src_ptr,  # fp64 level-major tree of n_old atoms
+        dst_ptr,  # fp64 level-major tree of n_new atoms (n_new >= n_old)
+        n_old,
+        n_new,
+        LEVELS: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Copy every level of the old tree to the front of the same level of
+        the new tree (grid: ``(LEVELS, cdiv(n_old, BLOCK))``).
+
+        Level ``lv`` holds ``n >> lv`` nodes and starts at
+        ``sum_{l < lv} (n >> l)``; the sealed prefix's dyadic nodes are the
+        first ``n_old >> lv`` of each level in both trees.
+        """
+        lv = tl.program_id(0)
+        blk = tl.program_id(1)
+        src_off = 0
+        dst_off = 0
+        for l in tl.static_range(LEVELS):
+            take = l < lv
+            src_off += tl.where(take, n_old >> l, 0)
+            dst_off += tl.where(take, n_new >> l, 0)
+        size = n_old >> lv
+        j = blk * BLOCK + tl.arange(0, BLOCK)
+        mask = j < size
+        vals = tl.load(src_ptr + src_off + j, mask=mask, other=0.0)
+        tl.store(dst_ptr + dst_off + j, vals, mask=mask)
 
     @triton.jit(do_not_specialize=["n_leaves", "n_tokens"])
     def _leaf_totals_fp8_kernel(
@@ -1087,17 +1126,86 @@ def raw_fp8_tree_triton(
     lc = ca.bit_length() - 1
     nc = r_atoms // ca
     lnc = nc.bit_length() - 1
-    n_chunks = layout.n_roots * nc
+    _fill_fp8_tree_roots(k_fp8, scale, flat, layout, 0, r_atoms, ca, lc, nc, lnc, dim)
+    return flat
+
+
+def _fill_fp8_tree_roots(k_fp8, scale, flat, layout, first_root, r_atoms, ca, lc, nc, lnc, dim):
+    """Write the nodes of roots ``[first_root, n_roots)`` of ``layout`` into ``flat``."""
+    new_roots = layout.n_roots - first_root
+    if new_roots <= 0:
+        return
+    n_chunks = new_roots * nc
     mom = torch.empty((n_chunks, 2, dim), dtype=torch.float64, device=k_fp8.device)
     _fp8_chunk_tree_kernel[(n_chunks,)](
-        k_fp8, scale, flat, mom, layout.n_roots, layout.n_tokens,
+        k_fp8, scale, flat, mom, layout.n_roots, layout.n_tokens, first_root * nc,
         ATOM=layout.atom, R=r_atoms, CA=ca, LC=lc, D=dim, num_warps=4,
     )
     if nc > 1:
-        _fp8_upper_tree_kernel[(layout.n_roots,)](
-            mom, flat, layout.n_roots,
+        _fp8_upper_tree_kernel[(new_roots,)](
+            mom, flat, layout.n_roots, first_root,
             ATOM=layout.atom, R=r_atoms, CA=ca, LC=lc, LNC=lnc, D=dim, num_warps=4,
         )
+
+
+TREE_COPY_BLOCK = 1024
+
+
+def raw_fp8_tree_triton_incremental(
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+    layout,
+    cached_flat: torch.Tensor,
+    cached_tokens: int,
+) -> torch.Tensor:
+    """Extend the previous chunk's tree instead of rebuilding it.
+
+    Dyadic nodes never straddle a root, so for the sealed prefix
+    ``[0, cached_tokens)`` every node's ``sum(K)`` / ``sum(K^2)`` — and hence
+    its SSE — is identical in the tree of the longer prefix. Only the level
+    offsets move (each level grows). The old levels are copied into place and
+    the stage-1/stage-2 kernels run for the new roots only, so the raw FP8
+    keys of the prefix are not read again. Bitwise identical to
+    :func:`raw_fp8_tree_triton` on the full prefix (per-node fp64 reductions
+    are the same); λ-search, Split and Merge then run on the complete tree as
+    before, because their global targets (M0, λ, merge target) do change.
+
+    Falls back to the full build when the cache does not line up (different
+    atom/root, not a whole number of roots, or not a strict prefix).
+    """
+    r_atoms, _levels = _check(layout)
+    n_old = int(cached_tokens)
+    old_layout = type(layout)(layout.atom, layout.root, n_old)
+    if (
+        n_old <= 0
+        or n_old % layout.root
+        or n_old >= layout.n_tokens
+        or cached_flat.numel() != old_layout.n_nodes
+        or cached_flat.dtype != torch.float64
+        or cached_flat.device != k_fp8.device
+    ):
+        return raw_fp8_tree_triton(k_fp8, k_scale, layout)
+    dim = int(k_fp8.shape[1])
+    if dim != 128:
+        raise ValueError(f"raw-FP8 tree supports D=128, got {dim}")
+    if k_fp8.dtype == torch.uint8:
+        k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+    if not k_fp8.is_contiguous():
+        k_fp8 = k_fp8.contiguous()
+    scale = k_scale.reshape(-1).to(torch.float32).contiguous()
+    flat = torch.empty(layout.n_nodes, dtype=torch.float64, device=k_fp8.device)
+    grid = (layout.levels, triton.cdiv(old_layout.n_atoms, TREE_COPY_BLOCK))
+    _tree_copy_levels_kernel[grid](
+        cached_flat, flat, old_layout.n_atoms, layout.n_atoms,
+        LEVELS=layout.levels, BLOCK=TREE_COPY_BLOCK, num_warps=4,
+    )
+    ca = max(1, min(r_atoms, TREE_CHUNK_TOKENS // layout.atom))
+    lc = ca.bit_length() - 1
+    nc = r_atoms // ca
+    lnc = nc.bit_length() - 1
+    _fill_fp8_tree_roots(
+        k_fp8, scale, flat, layout, old_layout.n_roots, r_atoms, ca, lc, nc, lnc, dim
+    )
     return flat
 
 
@@ -1246,4 +1354,14 @@ def warmup_triton_kernels(device, cfg) -> None:
         means = leaf_key_means(keys, scale, part.leaf_start, part.leaf_len)
         for fmt in (None, "ue8m0"):
             requant_summaries(means, fmt)
+    if cfg.root // cfg.atom >= 2:
+        # raw-FP8 tree: full build and the incremental (cached prefix) variant.
+        from sglang.srt.layers.attention.nsa.adaptive_hisa.partition_gpu import TreeLayout
+
+        keys = torch.zeros(2 * cfg.root, 128, dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.ones(2 * cfg.root, dtype=torch.float32, device=device)
+        old = raw_fp8_tree_triton(keys, scale, TreeLayout(cfg.atom, cfg.root, cfg.root))
+        raw_fp8_tree_triton_incremental(
+            keys, scale, TreeLayout(cfg.atom, cfg.root, 2 * cfg.root), old, cfg.root
+        )
     torch.cuda.synchronize(device)

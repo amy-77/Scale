@@ -1009,18 +1009,23 @@ def block_sparse_mqa_triton(
     cu_seqlen_ke: torch.Tensor,  # [seq] i32
 ) -> torch.Tensor:
     """Block-sparse MQA for ragged prefill. Supports kv_block_size in
-    {8, 16, 32, 64, 128}.
+    {1, 8, 16, 32, 64, 128}.
 
     Dispatch:
       kv_block_size >= 64 → original kernel; CTA per (seq, topk*sub) with
         BLOCK_N=64 inner tile.
       kv_block_size <  64 → grouped kernel; GROUP_SIZE=64/k consecutive
         topk indices fuse into one [64,D] GEMM tile via row-gather.
+      kv_block_size == 1 → ``topk_block_index`` holds token ids (-1 padding
+        allowed; padded / out-of-range rows score -inf). Used by the
+        Adaptive-HISA sparse prefill fine scorer: its candidates are the
+        tokens of variable-length leaves, gathered from the flat index-K.
+        Tile [64 tokens, D] per inner step, one CTA per (row, 2048 tokens).
     """
     assert q_fp8.ndim == 3
-    assert kv_block_size in (8, 16, 32, 64, 128), (
+    assert kv_block_size in (1, 8, 16, 32, 64, 128), (
         f"unsupported kv_block_size={kv_block_size}; expected one of "
-        "{8,16,32,64,128}"
+        "{1,8,16,32,64,128}"
     )
     seq_len, H, D = q_fp8.shape
     seq_kv = k_fp8.shape[0]
@@ -1036,6 +1041,9 @@ def block_sparse_mqa_triton(
         # K=8 K_CHUNKS=32 (not 64): KC=64 catastrophically regressed at
         # block_topk≤256 (constexpr loop runs full 64 iters, half masked).
         # KC=32 wins universally across block_topk ∈ {256,512,1024,2048}.
+        # K=1 (token ids, 8192 per row on H20): G=64/KC=32/4 warps sweeps best
+        # (1.11 ms per 2048 rows; G=128/256 or 8 warps are 10-40% slower).
+        1: (64, 32, 4, 2),
         8: (8, 32, 4, 2),
         16: (16, 32, 8, 3),
         32: (8, 32, 8, 3),

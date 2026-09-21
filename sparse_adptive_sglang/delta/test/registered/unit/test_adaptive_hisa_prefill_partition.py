@@ -1429,6 +1429,62 @@ class TestRawFp8RegisterPath(unittest.TestCase):
             rel = (chunked - single).abs() / single.abs().clamp_min(1.0)
             self.assertLess(float(rel.max()), 1e-12, f"tree mismatch at N={n}")
 
+    def test_incremental_tree_is_bitwise_identical(self):
+        """Extending the previous chunk's tree == rebuilding it from scratch."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        from sglang.srt.layers.attention.nsa.adaptive_hisa import partition_kernels as pk
+        from sglang.srt.layers.attention.nsa.adaptive_hisa.partition_gpu import TreeLayout
+        from sglang.srt.layers.attention.nsa.adaptive_hisa.pkey_fp8_builder import (
+            build_key_tree_from_fp8,
+        )
+
+        device = torch.device("cuda")
+        n_max = ROOT * 24
+        k, scale = _keys(n_max, seed=7)
+        k, scale = k.to(device), scale.to(device)
+        for atom, root in ((ATOM, ROOT), (1, ROOT), (ATOM * 4, ROOT)):
+            cached, n_old = None, 0
+            # chunked prefill: the sealed prefix grows by a few roots per chunk
+            for n in (root, root * 3, root * 4, root * 9, n_max):
+                layout = TreeLayout(atom, root, n)
+                full = pk.raw_fp8_tree_triton(k[:n], scale[:n], layout)
+                if cached is not None:
+                    inc = pk.raw_fp8_tree_triton_incremental(k[:n], scale[:n], layout, cached, n_old)
+                    self.assertTrue(torch.equal(inc, full), f"atom={atom} root={root} N={n}")
+                    via_builder, _ = build_key_tree_from_fp8(
+                        k[:n], scale[:n], n, atom=atom, root=root, tree_cache=(cached, n_old)
+                    )
+                    self.assertTrue(torch.equal(via_builder, full))
+                cached, n_old = full, n
+            # not a strict prefix / misaligned cache -> silently rebuilds in full
+            layout = TreeLayout(atom, root, n_max)
+            self.assertTrue(torch.equal(
+                pk.raw_fp8_tree_triton_incremental(k, scale, layout, cached, n_max), cached))
+            half = pk.raw_fp8_tree_triton(k[: n_max // 2], scale[: n_max // 2], TreeLayout(atom, root, n_max // 2))
+            self.assertTrue(torch.equal(
+                pk.raw_fp8_tree_triton_incremental(k, scale, layout, half, n_max // 2 - 1), cached))
+
+    def test_tree_cache_epoch_and_final(self):
+        """The per-request tree cache only serves the same epoch and strict prefixes."""
+        from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import _TreeCache
+
+        cache = _TreeCache()
+        flat = torch.zeros(3)
+        cache.put(4, 1, epoch=2, n_complete=512, flat=flat)
+        self.assertIsNone(cache.get(4, 1, 3, 1024))  # request slot reused
+        self.assertIsNone(cache.get(4, 1, 2, 512))  # same prefix: nothing to extend
+        self.assertIsNone(cache.get(5, 1, 2, 1024))  # other layer
+        hit = cache.get(4, 1, 2, 1024)
+        self.assertIsNotNone(hit)
+        self.assertIs(hit[0], flat)
+        self.assertEqual(hit[1], 512)
+        cache.drop(4, 1)
+        self.assertIsNone(cache.get(4, 1, 2, 1024))
+        cache.put(4, 1, epoch=2, n_complete=512, flat=flat)
+        cache.release(1)
+        self.assertIsNone(cache.get(4, 1, 2, 1024))
+
     def test_radix_selection_matches_sort_path(self):
         """CUDA k-th selection (merge thresholds, repair pops) is bit-identical to sorting."""
         if not torch.cuda.is_available():

@@ -1933,6 +1933,32 @@ class Indexer(MultiPlatformOp):
         k_offset = k_fp8.shape[0]
         build_partition = partition_enabled()
 
+        if build_partition and not _is_hip and seq_lens_expanded.shape[0] == q_offset:
+            # Adaptive sparse prefill: Top-2048 from summary-selected leaves +
+            # the causal local window of the previous chunk's partition.
+            from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_select import (
+                sparse_prefill_admission,
+                sparse_prefill_topk,
+            )
+
+            admission = sparse_prefill_admission(forward_batch, layer_id, metadata)
+            if admission is not None:
+                with self._with_real_sm_count():
+                    topk_result[:q_offset] = sparse_prefill_topk(
+                        forward_batch,
+                        layer_id,
+                        q_fp8[:q_offset],
+                        weights[:q_offset],
+                        seq_lens_expanded,
+                        block_tables,
+                        admission,
+                        k_flat=(k_fp8, k_scale) if k_fp8.shape[0] >= admission[3] else None,
+                    )
+                _schedule_adaptive_partition(
+                    forward_batch, layer_id, k_fp8, k_scale, self.scale_fmt
+                )
+                return topk_result
+
         # Baseline DSA: use one logits call when memory allows, otherwise run
         # the same algorithm in row chunks.
         need_chunk, free_mem = self._should_chunk_mqa_logits(
