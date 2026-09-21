@@ -246,7 +246,8 @@ class TestPartitionConfig(_Base):
         cfg = get_config()
         self.assertTrue(cfg.enabled)
         self.assertEqual((cfg.split_backend, cfg.merge_policy, cfg.merge_rounds), ("gpu", "sync_nonoverlap", 2))
-        self.assertEqual((cfg.atom, cfg.root, cfg.summary_compression), (1, 256, 8))
+        self.assertEqual((cfg.atom, cfg.root, cfg.summary_compression), (1, 256, 32))
+        self.assertEqual((cfg.merge_target_divisor, cfg.merge_target_rounds), (0, 4))
         self.assertEqual((cfg.partition_metric, cfg.method_name, cfg.energy_rows), ("key_sse", "P-key", 128))
         self.assertEqual(cfg.max_merge_len, 0)
         self.assertTrue(cfg.build_summaries and not cfg.cpu_overlap)
@@ -604,7 +605,7 @@ class TestSummaries(_Base):
         self.assertTrue(torch.equal(fp8.view(torch.uint8), _keys(n_tokens)[0].view(torch.uint8).to(self.DEVICE)))
 
     def test_allocation_reuse_release_and_exhaustion(self):
-        cfg = get_config()
+        cfg = replace(get_config(), summary_compression=8).validate()  # M0 = 2048 / 8 = 256 rows
         part = build_partition_gpu(_scores("random", 2048).to(self.DEVICE), 2048, cfg)
         pool = SummaryPool(num_layers=2, pages_per_layer=8, device=self.DEVICE)
         e1 = pool.allocate(0, 3, 0, part)
@@ -1161,7 +1162,8 @@ class TestKeyMetric(_Base):
     def test_target_merge_reaches_l_over_64_and_matches_reference(self):
         from sglang.srt.layers.attention.nsa.adaptive_hisa.partition_gpu import target_merge_threshold
 
-        _set_env(self.ENV, MERGE_TARGET_DIVISOR="64")
+        # the L/8 -> L/64 @ 8 reference configuration (defaults are L/32 and 4 rounds since 2026-09-22)
+        _set_env(self.ENV, MERGE_TARGET_DIVISOR="64", SUMMARY_COMPRESSION="8", MERGE_TARGET_ROUNDS="8")
         cfg = get_config()
         self.assertEqual((cfg.merge_target_divisor, cfg.merge_target_rounds), (64, 8))
         self.assertIn("merge_target=L/64@8", cfg.describe())

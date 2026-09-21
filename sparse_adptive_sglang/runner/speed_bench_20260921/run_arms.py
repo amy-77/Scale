@@ -43,7 +43,17 @@ ADAPTIVE_ENV = {
     "SGLANG_NSA_ADAPTIVE_HISA_FORWARD_TIMING": "0",
 }
 
+# 2026-09-22 02:xx: adopted split L/32 -> merge L/128 in 4 rounds as the code default. ADAPTIVE_ENV above
+# keeps the old L/8 -> L/64 @ 8 values so the adaptive / adaptive_sp_v1..v5 arms stay reproducible;
+# new arms use ADAPTIVE_ENV_32 (== adaptive_sp_v5_c32d128, TTFT 42.81 s / TPOT 17.85 ms).
+ADAPTIVE_ENV_32 = {**ADAPTIVE_ENV,
+                   "SGLANG_NSA_ADAPTIVE_HISA_SUMMARY_COMPRESSION": "32",
+                   "SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_DIVISOR": "128",
+                   "SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_ROUNDS": "4"}
 ARMS = {
+    "adaptive_sp_v6": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
+                           env={**ADAPTIVE_ENV_32, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
+                                "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048"}, override=None),
     "dsa": dict(pythonpath="/workspace/qyl/code/sglang_hisa/python", env={}, override=None),
     "hisa64": dict(pythonpath="/workspace/qyl/code/sglang_hisa_fixed_e399d9f/python",
                    env={"SGLANG_HISA_HEADWISE_HIERARCHICAL": "0", "SGLANG_HISA_EAGER_CORRECTNESS": "0",

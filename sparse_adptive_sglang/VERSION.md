@@ -103,3 +103,14 @@ production-shape cases, CUDA-graph replay).
   decode selector; e2e TTFT 42.81 s (-1.85 s), TPOT 17.85 ms (= HISA-64). Cost: Top-2048 recall vs dense
   -0.75..-1.3 pt on the dump proxy (prefix part -1.5..-2.3 pt) -> needs a LongBench-v2 / RULER check before adoption.
 - Data: delta/docs_research/merge_config_bench_20260922.json, speed_bench_128k_20260921.md.
+
+## 2026-09-22 (02:50) — adopted split L/32 -> merge L/128 in 4 rounds
+
+- `config.py`: `SUMMARY_COMPRESSION` 8 -> 32, `merge_target_rounds` 8 -> 4 (`merge_target_divisor` stays a mode
+  switch, 0 = threshold merge; deployments set 128). `runner/deliverable_speed.env`, `run_arms.py`
+  (`ADAPTIVE_ENV_32`, arm `adaptive_sp_v6`) and `run_sparse_prefill_e2e.py` (arm `sparse_prefill_c32d128`,
+  per-arm method check) carry the new values; historical arms pin L/8 -> L/64 @ 8 explicitly.
+- Tests: defaults test updated; the L/8 -> L/64 reference test and the summary-pool page-count test pin the
+  old compression explicitly. 63 passed.
+- Accuracy run started 02:53 (arm `sparse_prefill_c32d128`, LongBench-v2 401 + RULER 32k/128k 364, ~10 h) to
+  compare with `sparse_prefill` (0.479 / 0.855 / 0.598).

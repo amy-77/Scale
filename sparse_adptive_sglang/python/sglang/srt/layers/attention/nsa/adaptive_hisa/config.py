@@ -25,11 +25,15 @@ resulting summaries in the B=1 decode pipeline without changing prefill:
   ``2 * (count - target)`` cheapest adjacent pairs, matches them
   non-overlapping, and merges the ``count - target`` cheapest matched pairs,
   until the leaf count reaches ``n_complete // D`` (never overshot except by
-  exact cost ties). A round can at most halve the count, so ``L/8 -> L/64``
-  needs >= 3 rounds; measured 4-5 on the 128K dumps, ``merge_target_rounds``
-  (default 8) caps it and idle rounds are cheap. ``D = 64`` matches HISA's
-  chunk count at chunk size 64 so accuracy comparisons are not confounded by
-  a higher chunk count.
+  exact cost ties). A round can at most halve the count, so ``L/32 -> L/128``
+  needs >= 2 rounds; measured exactly 3 on the 128K dumps (layers 0/30/50),
+  ``merge_target_rounds`` (default 4 = one spare) caps it. Idle rounds are
+  not free (~0.13 ms each in the build graph) and too few rounds is fatal
+  (leaves exceed the summary capacity and recall collapses), so keep one
+  spare. Until 2026-09-22 the defaults were ``L/8 -> L/64`` in 8 rounds
+  (= HISA's chunk count at 64); ``L/32 -> L/128`` builds 39% faster, halves
+  the coarse/select/decode-selector work (TTFT 44.66 -> 42.81 s, TPOT 18.07
+  -> 17.85 ms at 128K) for ~1 pt Top-2048 recall vs dense on the dumps.
 * ``split_backend = gpu`` is the production path (tree, λ search, repair,
   merge and FP8 summaries on the current CUDA stream). ``cpu_reference`` is
   the numba path that was A/B'ed before (``v7_reuse``), kept as a reference
@@ -49,7 +53,7 @@ from functools import lru_cache
 
 ATOM = 1
 ROOT = 256
-SUMMARY_COMPRESSION = 8  # M0 = N_complete / 8
+SUMMARY_COMPRESSION = 32  # M0 = N_complete / 32 (split leaves; was 8 until 2026-09-22)
 CANDIDATE_TOKENS = 8192
 INDEX_TOPK = 2048
 FP8_MAX = 448.0
@@ -139,7 +143,7 @@ class PartitionConfig:
     # 0 = threshold merge (merge_alpha * lambda, merge_rounds rounds). D > 0 =
     # merge the cheapest pairs down to n_complete // D leaves.
     merge_target_divisor: int = 0
-    merge_target_rounds: int = 8
+    merge_target_rounds: int = 4
     candidate_tokens: int = CANDIDATE_TOKENS
     index_topk: int = INDEX_TOPK
     # Decode guards and sealing granularity (see module constants).

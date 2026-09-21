@@ -41,6 +41,7 @@ CONTEXT_LEN = 163840
 #   sparse_prefill_c32k       prefill budget 32768
 #   sparse_prefill_final32k   8192 for intermediate chunks, 32768 for the final chunk
 #   sparse_prefill_dense_final intermediate chunks sparse (8192), final chunk dense DSA
+#   sparse_prefill_c32d128    split L/32 -> merge L/128 in 4 rounds (2026-09-22 defaults; others L/8 -> L/64 @ 8)
 # --quick-niah: skip LongBench, RULER 128k niah_multikey_1/2/3 only (42 rows), output <arm>_quickniah/
 _ARMS = {
     'sparse_prefill': {},
@@ -48,6 +49,10 @@ _ARMS = {
     'sparse_prefill_c32k': {'SPARSE_PREFILL_CANDIDATES': '32768'},
     'sparse_prefill_final32k': {'SPARSE_PREFILL_FINAL_CANDIDATES': '32768'},
     'sparse_prefill_dense_final': {'SPARSE_PREFILL_DENSE_FINAL': '1'},
+    # 2026-09-22: adopted defaults (split L/32 -> merge L/128, 4 rounds); the common env below pins the
+    # historical L/8 -> L/64 @ 8 so the earlier arms stay reproducible. Decode budget/sink/tail unchanged.
+    'sparse_prefill_c32d128': {'SUMMARY_COMPRESSION': '32', 'MERGE_TARGET_DIVISOR': '128',
+                               'MERGE_TARGET_ROUNDS': '4'},
 }
 _ARM_BASE = sys.argv[sys.argv.index('--arm') + 1] if '--arm' in sys.argv else 'sparse_prefill'
 if _ARM_BASE not in _ARMS:
@@ -58,7 +63,7 @@ NAME = 'adaptive-0921-h202-' + ARM.replace('_', '-') + '-e2e'
 # first arm froze into OUT/source; later arms get their own frozen tree
 FROZEN = OUT / ('source' if ARM == 'sparse_prefill' else f'source_{ARM}')
 EXPECTED_METRIC = 'key_sse'
-EXPECTED_METHOD = 'P-key-sync_nonoverlap-target64'
+EXPECTED_METHOD = 'P-key-sync_nonoverlap-target%s' % _ARMS[_ARM_BASE].get('MERGE_TARGET_DIVISOR', '64')
 EXPECTED_DECODE_CHUNK = '64'
 ACTIVE = None
 
@@ -165,6 +170,7 @@ def server_env():
         'SGLANG_NSA_ADAPTIVE_HISA_SPLIT_BACKEND': 'gpu',
         'SGLANG_NSA_ADAPTIVE_HISA_BUILD_SUMMARIES': '1',
         'SGLANG_NSA_ADAPTIVE_HISA_MERGE_POLICY': 'sync_nonoverlap',
+        'SGLANG_NSA_ADAPTIVE_HISA_SUMMARY_COMPRESSION': '8',
         'SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_DIVISOR': '64',
         'SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_ROUNDS': '8',
         'SGLANG_NSA_ADAPTIVE_HISA_MAX_MERGE_LEN': '0',
