@@ -86,6 +86,18 @@ ARMS = {
                                env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
                                     "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048"}, override=None,
                                chunk=4096),
+    # 2026-09-22 01:xx: merge-config sweep on real dumps (merge_config_bench.py). *_r5: L/8 -> L/64 with
+    # 5 rounds (data needs 4; one spare). *_c32d128: split L/32 -> merge L/128 in 4 rounds (needs 3).
+    "adaptive_sp_v5_r5": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
+                              env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
+                                   "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048",
+                                   "SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_ROUNDS": "5"}, override=None),
+    "adaptive_sp_v5_c32d128": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
+                                   env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
+                                        "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048",
+                                        "SGLANG_NSA_ADAPTIVE_HISA_SUMMARY_COMPRESSION": "32",
+                                        "SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_DIVISOR": "128",
+                                        "SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_ROUNDS": "4"}, override=None),
     "adaptive_sp_df": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
                            env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
                                 "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048",

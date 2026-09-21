@@ -155,6 +155,8 @@ decode（与 h201 相同）
 | h202 + decode 选择算子 fast path 优化（09-22 00:xx） | 45.33 s | 18.1 ms |
 | **h202 + Top-K 无 cat（09-22 01:xx，当前代码）** | **44.66 s** | **18.1 ms** |
 | 同上，`--chunked-prefill-size 4096` | 50.05 s | 18.2 ms |
+| 同上 + `MERGE_TARGET_ROUNDS=5`（真实数据 4 轮达标，划分 bitwise 相同） | 43.63 s | 18.1 ms |
+| 同上 + split L/32 → merge L/128（4 轮；recall −0.8~−1.3 pt，待精度验证） | 42.81 s | 17.85 ms |
 
 128K 最后一个 chunk、每层稀疏 indexer 各阶段（H20）：coarse GEMM 1.3 + 选叶 0.5 + 精排 4.4 + 局部窗口密集 GEMM 2.4 + cat/Top-2048 2.1 ≈ 10.7 ms
 （精排、局部窗口都已到 fp8 算力上限；HISA 自己的 K=64 块 kernel 处理同样 token 反而慢 6%），side stream 上每 chunk 建分区 4.7 ms（merge 8 轮 2.7 ms 占大头）。

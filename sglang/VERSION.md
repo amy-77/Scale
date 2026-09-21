@@ -92,3 +92,14 @@ production-shape cases, CUDA-graph replay).
 - `--chunked-prefill-size 4096` with the same code: TTFT 50.05 s (+5.4 s). Per-chunk prefill time is ~flat in
   the prefix length (2.85 s per 8192 chunk, 1.5 s per 4096 chunk), so halving the chunk doubles the per-chunk
   fixed cost (61 x 4.7 ms partition build per chunk ~= 0.29 s of the +0.34 s per extra chunk). Not adopted.
+
+## 2026-09-22 (01:35) — merge rounds / granularity sweep on real 128K dumps (merge_config_bench.py)
+
+- L/8 -> L/64 reaches the target in exactly 4 merge rounds on real data (layers 0/30/50); each idle round costs
+  ~0.13 ms in the build graph. 8 -> 5 rounds: build 4.38 -> 4.00 ms, partition bitwise identical, e2e 128K TTFT
+  44.66 -> 43.63 s (-1.03 s). 3 rounds does NOT reach the target (2.8K leaves > capacity 1920) and recall collapses,
+  so keep a spare round (5 or 6). Defaults unchanged in code; set MERGE_TARGET_ROUNDS=5 in the deployment env.
+- split L/32 -> merge L/128 (4 rounds, needs 3): build 2.7 ms (-39%), 960 leaves halve the coarse GEMM / select /
+  decode selector; e2e TTFT 42.81 s (-1.85 s), TPOT 17.85 ms (= HISA-64). Cost: Top-2048 recall vs dense
+  -0.75..-1.3 pt on the dump proxy (prefix part -1.5..-2.3 pt) -> needs a LongBench-v2 / RULER check before adoption.
+- Data: delta/docs_research/merge_config_bench_20260922.json, speed_bench_128k_20260921.md.
