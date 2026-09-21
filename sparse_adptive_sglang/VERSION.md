@@ -114,3 +114,11 @@ production-shape cases, CUDA-graph replay).
   old compression explicitly. 63 passed.
 - Accuracy run started 02:53 (arm `sparse_prefill_c32d128`, LongBench-v2 401 + RULER 32k/128k 364, ~10 h) to
   compare with `sparse_prefill` (0.479 / 0.855 / 0.598).
+
+## 2026-09-22 (03:10) — current-chunk local window: keep dense (HISA-style 64-token blocks rejected)
+
+- The 2.4 ms/layer/chunk dense window GEMM is fine scoring of the ~4K causal window tokens at the fp8 rate, on top
+  of the 8192 leaf tokens. Folding the window into the token budget as mean-summarised 64-token blocks (HISA's
+  treatment, tried behind a flag) saves time only by displacing prefix candidates: recall -4.4 / -6.4 pt at
+  budget 8192; at budget 12288 recall is back (+0.5) but the chunk is slower than dense. Not adopted, code removed;
+  numbers in delta/docs_research/local_window_block_vs_dense_20260922.json.
