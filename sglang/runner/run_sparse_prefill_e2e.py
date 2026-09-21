@@ -42,6 +42,7 @@ CONTEXT_LEN = 163840
 #   sparse_prefill_final32k   8192 for intermediate chunks, 32768 for the final chunk
 #   sparse_prefill_dense_final intermediate chunks sparse (8192), final chunk dense DSA
 #   sparse_prefill_c32d128    split L/32 -> merge L/128 in 4 rounds (2026-09-22 defaults; others L/8 -> L/64 @ 8)
+#   sparse_prefill_c32d128_dense_final  same + final chunk dense (the accuracy configuration)
 # --quick-niah: skip LongBench, RULER 128k niah_multikey_1/2/3 only (42 rows), output <arm>_quickniah/
 _ARMS = {
     'sparse_prefill': {},
@@ -53,6 +54,10 @@ _ARMS = {
     # historical L/8 -> L/64 @ 8 so the earlier arms stay reproducible. Decode budget/sink/tail unchanged.
     'sparse_prefill_c32d128': {'SUMMARY_COMPRESSION': '32', 'MERGE_TARGET_DIVISOR': '128',
                                'MERGE_TARGET_ROUNDS': '4'},
+    # accuracy deliverable: 32:128 + the final prompt chunk on the dense DSA indexer (speed arms run
+    # without dense final; 128K TTFT cost of dense final ~1.5-2 s)
+    'sparse_prefill_c32d128_dense_final': {'SUMMARY_COMPRESSION': '32', 'MERGE_TARGET_DIVISOR': '128',
+                                           'MERGE_TARGET_ROUNDS': '4', 'SPARSE_PREFILL_DENSE_FINAL': '1'},
 }
 _ARM_BASE = sys.argv[sys.argv.index('--arm') + 1] if '--arm' in sys.argv else 'sparse_prefill'
 if _ARM_BASE not in _ARMS:

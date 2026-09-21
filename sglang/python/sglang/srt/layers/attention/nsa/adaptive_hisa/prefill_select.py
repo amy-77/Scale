@@ -201,6 +201,55 @@ def select_mode() -> str:
     return mode
 
 
+LOCAL_BLOCK = 64
+
+
+def local_mode() -> str:
+    """How the current chunk's causal window ``[n_complete, pos]`` enters the Top-K.
+
+    ``dense`` (default): every row scores its whole window exactly with the
+    dense DeepGEMM logits kernel (compute-bound, ~2.4 ms per layer per 8192-row
+    chunk on H20 — the largest single stage of the sparse indexer, and work the
+    HISA baseline does not do at all).
+
+    ``block``: the window is folded into the leaf selection as uniform
+    ``LOCAL_BLOCK``-token mean-summarised pseudo-leaves, exactly HISA's
+    treatment of the current chunk (mean-pool all K, block-causal ``ke``,
+    ``force_maintain`` of the block holding the query). Blocks compete with the
+    prefix leaves for the same token budget; the block holding each row's own
+    position is forced in. Requires the flat index-K (``k_flat``); otherwise the
+    dense window is used.
+    """
+    mode = os.environ.get("SGLANG_NSA_ADAPTIVE_HISA_PREFILL_LOCAL", "dense").strip().lower()
+    if mode not in ("dense", "block"):
+        raise ValueError(f"SGLANG_NSA_ADAPTIVE_HISA_PREFILL_LOCAL={mode!r}; use dense|block")
+    return mode
+
+
+def local_block_leaves(k_fp8, k_scale, n_complete: int, seq_len: int, scale_fmt=None,
+                       block: int = LOCAL_BLOCK):
+    """Uniform ``block``-token pseudo-leaves over ``[n_complete, seq_len)``.
+
+    Returns ``(fp8 [nb,128], fp32 [nb], start int32 [nb], len int32 [nb])`` in
+    the same summary format as the partition leaves (FP64 sum -> BF16 mean ->
+    FP8 via ``requant_from_totals``); the last block may be short.
+    """
+    from .summary_kernels import requant_from_totals
+
+    device = k_fp8.device
+    L = int(seq_len) - int(n_complete)
+    nb = (L + block - 1) // block
+    keys = k_fp8[n_complete:seq_len].to(torch.float32) * k_scale[n_complete:seq_len].to(torch.float32)[:, None]
+    if L != nb * block:
+        keys = torch.nn.functional.pad(keys, (0, 0, 0, nb * block - L))
+    totals = keys.view(nb, block, keys.shape[-1]).sum(dim=1, dtype=torch.float64)
+    lens = torch.full((nb,), block, dtype=torch.int32, device=device)
+    lens[-1] = L - block * (nb - 1)
+    fp8, scale = requant_from_totals(totals, lens, scale_fmt)
+    starts = (n_complete + block * torch.arange(nb, device=device)).to(torch.int32)
+    return fp8, scale.reshape(-1), starts, lens
+
+
 def select_candidates_weighted(
     coarse: torch.Tensor,
     leaf_start: torch.Tensor,
