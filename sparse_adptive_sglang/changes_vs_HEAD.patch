@@ -1,0 +1,1163 @@
+diff --git a/python/sglang/srt/layers/attention/nsa/headmap_probe.py b/python/sglang/srt/layers/attention/nsa/headmap_probe.py
+index 275ffe361..1622f6f64 100644
+--- a/python/sglang/srt/layers/attention/nsa/headmap_probe.py
++++ b/python/sglang/srt/layers/attention/nsa/headmap_probe.py
+@@ -17,6 +17,13 @@ import torch
+ class ProbeInput(NamedTuple):
+     request_id: str
+     candidate_token_ids: torch.Tensor
++    selected_indexer_head_id: Optional[int]
++    selected_indexer_exact_top720_recall: Optional[float]
++    exact_indexer_topk_ids: Optional[dict[int, torch.Tensor]]
++    exact_merged_topk_ids: Optional[dict[int, torch.Tensor]]
++    selector_ablation_per_indexer_ids: Optional[dict[str, torch.Tensor]]
++    selector_ablation_shared_ids: Optional[dict[str, torch.Tensor]]
++    selector_ablation_stats: Optional[dict[str, float]]
+     all_indexer_q: Optional[torch.Tensor]
+     all_indexer_gate: Optional[torch.Tensor]
+     candidate_head_ids: Optional[torch.Tensor]
+@@ -117,6 +124,33 @@ def save_exact_topk_ids() -> bool:
+     ).lower() in ("1", "true", "yes")
+ 
+ 
++def exact_indexer_recall_enabled() -> bool:
++    return os.environ.get(
++        "SGLANG_NSA_HEADMAP_PROBE_EXACT_INDEXER_RECALL", "0"
++    ).lower() in ("1", "true", "yes")
++
++
++def exact_dense_ablation_enabled() -> bool:
++    return os.environ.get(
++        "SGLANG_NSA_HEADMAP_PROBE_EXACT_DENSE_ABLATION", "0"
++    ).lower() in ("1", "true", "yes")
++
++
++def selected_static_indexer(layer_id: int, tp_rank: int) -> Optional[int]:
++    path = os.environ.get("SGLANG_NSA_HEADMAP_PROBE_STATIC_CONFIG")
++    if not path:
++        return None
++    config = json.loads(Path(path).read_text(encoding="utf-8"))
++    assignment = config.get("static_assignment_by_layer", {}).get(str(layer_id))
++    if assignment is None:
++        return None
++    if len(assignment) != 8 or not 0 <= tp_rank < len(assignment):
++        raise RuntimeError(
++            f"invalid static probe assignment for layer={layer_id}, rank={tp_rank}"
++        )
++    return int(assignment[tp_rank])
++
++
+ def save_group_router_features() -> bool:
+     return os.environ.get(
+         "SGLANG_NSA_HEADMAP_PROBE_SAVE_GROUP_ROUTER_FEATURES", "0"
+@@ -128,6 +162,15 @@ def put_picks(
+     picks: torch.Tensor,
+     *,
+     request_id: str,
++    selected_indexer_head_id: Optional[int] = None,
++    selected_indexer_exact_top720_recall: Optional[float] = None,
++    exact_indexer_topk_ids: Optional[dict[int, torch.Tensor]] = None,
++    exact_merged_topk_ids: Optional[dict[int, torch.Tensor]] = None,
++    selector_ablation_per_indexer_ids: Optional[
++        dict[str, torch.Tensor]
++    ] = None,
++    selector_ablation_shared_ids: Optional[dict[str, torch.Tensor]] = None,
++    selector_ablation_stats: Optional[dict[str, float]] = None,
+     all_indexer_q: Optional[torch.Tensor] = None,
+     all_indexer_gate: Optional[torch.Tensor] = None,
+     candidate_head_ids: Optional[torch.Tensor] = None,
+@@ -141,6 +184,13 @@ def put_picks(
+     _INPUTS[layer_id] = ProbeInput(
+         request_id=request_id,
+         candidate_token_ids=picks,
++        selected_indexer_head_id=selected_indexer_head_id,
++        selected_indexer_exact_top720_recall=selected_indexer_exact_top720_recall,
++        exact_indexer_topk_ids=exact_indexer_topk_ids,
++        exact_merged_topk_ids=exact_merged_topk_ids,
++        selector_ablation_per_indexer_ids=selector_ablation_per_indexer_ids,
++        selector_ablation_shared_ids=selector_ablation_shared_ids,
++        selector_ablation_stats=selector_ablation_stats,
+         all_indexer_q=all_indexer_q,
+         all_indexer_gate=all_indexer_gate,
+         candidate_head_ids=candidate_head_ids,
+@@ -307,6 +357,88 @@ def maybe_dump_decode(
+         "exact_mla_top720_mass": exact_mla_top720_mass.cpu(),
+         "group_exact_top720_mass": group_exact_top720_mass.cpu(),
+     }
++    if probe.exact_indexer_topk_ids is not None:
++        record["exact_indexer_topk_attention_mass"] = {
++            str(k): attention[:, ids[0].long()].sum(-1).transpose(0, 1).cpu()
++            for k, ids in probe.exact_indexer_topk_ids.items()
++        }
++    if probe.exact_merged_topk_ids is not None:
++        record["exact_merged_topk_attention_mass"] = {
++            str(k): attention[:, ids[0].long()].sum(-1).cpu()
++            for k, ids in probe.exact_merged_topk_ids.items()
++        }
++        merged_2048 = probe.exact_merged_topk_ids.get(2048)
++        if merged_2048 is not None:
++            exact_ids = merged_2048[0].long()
++            record["official_vs_recomputed_merged_top2048_recall"] = (
++                torch.isin(exact_ids, shared_token_ids[shared_valid])
++                .float()
++                .mean()
++                .cpu()
++            )
++    if probe.selector_ablation_per_indexer_ids is not None:
++        per_indexer_mass = {}
++        per_indexer_recall = {}
++        exact_top720 = (
++            probe.exact_indexer_topk_ids.get(720)[0].long()
++            if probe.exact_indexer_topk_ids is not None
++            and probe.exact_indexer_topk_ids.get(720) is not None
++            else None
++        )
++        for name, ids in probe.selector_ablation_per_indexer_ids.items():
++            token_ids = ids[0].long()
++            valid_ids = (token_ids >= 0) & (token_ids < seq_len)
++            gather_ids = token_ids.clamp(0, seq_len - 1)
++            per_indexer_mass[name] = (
++                attention[:, gather_ids]
++                .masked_fill(~valid_ids.unsqueeze(0), 0)
++                .sum(-1)
++                .transpose(0, 1)
++                .cpu()
++            )
++            if exact_top720 is not None:
++                sorted_ids = token_ids.masked_fill(~valid_ids, seq_len).sort(
++                    dim=-1
++                ).values
++                positions = torch.searchsorted(sorted_ids, exact_top720)
++                in_range = positions < sorted_ids.shape[-1]
++                matched_ids = sorted_ids.gather(
++                    1, positions.clamp_max(sorted_ids.shape[-1] - 1)
++                )
++                per_indexer_recall[name] = (
++                    (in_range & (matched_ids == exact_top720))
++                    .float()
++                    .mean(dim=-1)
++                    .cpu()
++                )
++        record["selector_ablation_per_indexer_attention_mass"] = (
++            per_indexer_mass
++        )
++        if per_indexer_recall:
++            record["selector_ablation_per_indexer_exact_top720_recall"] = (
++                per_indexer_recall
++            )
++    if probe.selector_ablation_shared_ids is not None:
++        shared_mass = {}
++        for name, ids in probe.selector_ablation_shared_ids.items():
++            token_ids = ids[0].long()
++            valid_ids = (token_ids >= 0) & (token_ids < seq_len)
++            gather_ids = token_ids.clamp(0, seq_len - 1)
++            shared_mass[name] = (
++                attention[:, gather_ids]
++                .masked_fill(~valid_ids.unsqueeze(0), 0)
++                .sum(-1)
++                .cpu()
++            )
++        record["selector_ablation_shared_attention_mass"] = shared_mass
++    if probe.selector_ablation_stats is not None:
++        record["selector_ablation_stats"] = probe.selector_ablation_stats
++    if probe.selected_indexer_head_id is not None:
++        record["selected_indexer_head_id"] = probe.selected_indexer_head_id
++    if probe.selected_indexer_exact_top720_recall is not None:
++        record["selected_indexer_exact_top720_recall"] = (
++            probe.selected_indexer_exact_top720_recall
++        )
+     if probe.candidate_top8_sum is not None:
+         record["candidate_top8_sum"] = probe.candidate_top8_sum[0].float().cpu()
+     if probe.candidate_top8_context_summary is not None:
+diff --git a/python/sglang/srt/layers/attention/nsa/nsa_indexer.py b/python/sglang/srt/layers/attention/nsa/nsa_indexer.py
+index 46b52fd5f..1839b5e46 100644
+--- a/python/sglang/srt/layers/attention/nsa/nsa_indexer.py
++++ b/python/sglang/srt/layers/attention/nsa/nsa_indexer.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import math
+ from abc import ABC, abstractmethod
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+ 
+@@ -56,8 +57,14 @@ from sglang.srt.distributed import (
+ from sglang.srt.distributed.parallel_state import get_pp_group
+ from sglang.srt.layers import deep_gemm_wrapper
+ from sglang.srt.layers.attention.nsa import headmap_probe as _headmap_probe
++from sglang.srt.layers.attention.nsa import indexer_dump as _indexer_dump
+ from sglang.srt.layers.attention.nsa import per_head_paged as _per_head_paged
+ from sglang.srt.layers.attention.nsa import offline_unique_head_router as _offline_router
++from sglang.srt.layers.attention.nsa.adaptive_hisa.config import (
++    get_config as get_adaptive_hisa_config,
++    partition_enabled,
++    partition_reuse_logits_enabled,
++)
+ from sglang.srt.layers.attention.nsa.utils import (
+     is_nsa_enable_prefill_cp,
+     is_nsa_prefill_cp_in_seq_split,
+@@ -72,6 +79,105 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.server_args import get_global_server_args
+ 
+ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
++
++
++def _note_adaptive_queries(forward_batch, layer_id, q_fp8, weights) -> None:
++    if not partition_enabled():
++        return
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++        note_prefill_queries,
++    )
++
++    note_prefill_queries(forward_batch, layer_id, q_fp8, weights)
++
++
++def _schedule_adaptive_partition(
++    forward_batch, layer_id, k_fp8, k_scale, scale_fmt=None
++) -> None:
++    if not partition_enabled():
++        return
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++        schedule_prefill_partition,
++    )
++
++    schedule_prefill_partition(
++        forward_batch, layer_id, k_fp8=k_fp8, k_scale=k_scale, scale_fmt=scale_fmt
++    )
++
++
++def _prepare_adaptive_partition(forward_batch, layer_id, max_tokens):
++    if not partition_enabled():
++        return None
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++        prepare_prefill_partition,
++    )
++
++    return prepare_prefill_partition(
++        forward_batch, layer_id, max_tokens=max_tokens
++    )
++
++
++def _schedule_adaptive_partition_scores(
++    prepared, scores, forward_batch=None, k_fp8=None, k_scale=None, scale_fmt=None
++) -> None:
++    """Build from the calibration rows; raw K feeds the FP8 summaries (gpu)."""
++    if prepared is None:
++        return
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++        BuildContext,
++        schedule_prefill_partition_scores,
++    )
++
++    schedule_prefill_partition_scores(
++        prepared,
++        scores,
++        BuildContext(
++            k_fp8=k_fp8,
++            k_scale=k_scale,
++            scale_fmt=scale_fmt,
++            token_to_kv_pool=getattr(forward_batch, "token_to_kv_pool", None),
++        ),
++    )
++
++
++def _append_adaptive_calibration_rows(q, weights, ks, ke, prepared):
++    """Append duplicate unmasked rows without changing official row metadata."""
++    if prepared is None or prepared.n_complete == 0:
++        return q, weights, ks, ke
++    rows = prepared.q.shape[0]
++    return (
++        torch.cat((q, prepared.q)),
++        torch.cat((weights, prepared.w)),
++        torch.cat(
++            (ks, torch.zeros(rows, dtype=ks.dtype, device=ks.device))
++        ),
++        torch.cat(
++            (
++                ke,
++                torch.full(
++                    (rows,),
++                    prepared.n_complete,
++                    dtype=ke.dtype,
++                    device=ke.device,
++                ),
++            )
++        ),
++    )
++
++
++def _skip_adaptive_partition(forward_batch, layer_id, reason: str) -> None:
++    if not partition_enabled():
++        return
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import STATE
++
++    final = getattr(forward_batch, "prefill_final_cpu", None)
++    if not final or not bool(final[0]):
++        return
++    try:
++        req_idx = int(forward_batch.req_pool_indices[0].item())
++    except Exception:
++        return
++    STATE.skip(layer_id, req_idx, reason)
+ if TYPE_CHECKING:
+     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+ 
+@@ -769,6 +875,346 @@ class Indexer(MultiPlatformOp):
+ 
+ 
+ 
++    def _probe_selected_indexer_exact_top720_recall(
++        self,
++        forward_batch: ForwardBatch,
++        layer_id: int,
++        q_fp8: torch.Tensor,
++        metadata: BaseIndexerMetadata,
++        seqlens_32: torch.Tensor,
++        candidate_head_ids: torch.Tensor,
++        picks: torch.Tensor,
++    ) -> tuple[Optional[int], Optional[float]]:
++        """Compare the deployed candidate set with exact full-context Top-720.
++
++        This probe-only path runs one single-head DeepGEMM scan for the static
++        Indexer assigned to this TP rank.  Unit weight is intentional: query
++        quantization scale is positive and constant across keys, so it cannot
++        change a single head's token ranking.
++        """
++        if not _headmap_probe.exact_indexer_recall_enabled():
++            return None, None
++        from sglang.srt.layers.dp_attention import get_attention_tp_rank
++
++        selected_head = _headmap_probe.selected_static_indexer(
++            layer_id, int(get_attention_tp_rank())
++        )
++        if selected_head is None:
++            raise RuntimeError(
++                "exact Indexer recall probe requires "
++                "SGLANG_NSA_HEADMAP_PROBE_STATIC_CONFIG"
++            )
++        slots = (candidate_head_ids[0].long() == selected_head).nonzero().flatten()
++        if slots.numel() != 1:
++            raise RuntimeError(
++                f"static Indexer {selected_head} is absent or duplicated in probe candidates"
++            )
++
++        seq_len = int(seqlens_32.reshape(-1)[0].item())
++        exact_k = min(_per_head_paged.OUTK, seq_len)
++        if exact_k == 0:
++            return selected_head, 1.0
++        page_table = metadata.get_page_table_64()[:1]
++        kv_cache_fp8 = (
++            forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
++                layer_id=layer_id
++            )
++        )
++        kv_cache_fp8 = kv_cache_fp8.view(
++            kv_cache_fp8.shape[0],
++            64,
++            1,
++            self.head_dim + 4,
++        )
++        seqlens_2d = seqlens_32.reshape(-1)[:1].to(torch.int32).unsqueeze(-1)
++        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
++            seqlens_2d, 64, self.sm_count
++        )
++        if q_fp8.ndim != 4 or q_fp8.shape[1] != 1:
++            raise RuntimeError(
++                f"exact Indexer recall probe expects [B,1,H,D] q, got {q_fp8.shape}"
++            )
++        selected_q = q_fp8[:1]
++        # SM90 DeepGEMM only instantiates H=32/64 paged MQA.  Keep the native
++        # 64-head shape and zero all but the selected head; the fused reduction
++        # is then exactly that head's ReLU(QK) score.
++        unit_weight = torch.zeros(
++            (1, selected_q.shape[2]), dtype=torch.float32, device=q_fp8.device
++        )
++        unit_weight[0, selected_head] = 1.0
++        logits = deep_gemm.fp8_paged_mqa_logits(
++            selected_q,
++            kv_cache_fp8,
++            unit_weight,
++            seqlens_2d,
++            page_table,
++            schedule_metadata,
++            page_table.shape[1] * 64,
++            clean_logits=False,
++        )
++        exact_ids = logits[0, :seq_len].topk(
++            exact_k, largest=True, sorted=False
++        ).indices
++        approximate_ids = picks[0, int(slots.item())].long()
++        approximate_ids = approximate_ids[
++            (approximate_ids >= 0) & (approximate_ids < seq_len)
++        ]
++        recall = torch.isin(exact_ids, approximate_ids).float().mean()
++        return selected_head, float(recall.item())
++
++
++    def _probe_exact_dense_indexer_topk(
++        self,
++        forward_batch: ForwardBatch,
++        layer_id: int,
++        q_fp8: torch.Tensor,
++        weights: torch.Tensor,
++        metadata: BaseIndexerMetadata,
++        seqlens_32: torch.Tensor,
++    ) -> tuple[
++        Optional[dict[int, torch.Tensor]],
++        Optional[dict[int, torch.Tensor]],
++        Optional[dict[str, torch.Tensor]],
++        Optional[dict[str, torch.Tensor]],
++        Optional[dict[str, float]],
++    ]:
++        """Compute full-context FP8 Indexer Top-K ablations for probe rows.
++
++        Unlike the deployed chunk selector, this materializes all 64 by
++        sequence-length QK scores.  It is intentionally probe-only.
++        """
++        if not _headmap_probe.exact_dense_ablation_enabled():
++            return None, None, None, None, None
++        if q_fp8.ndim != 4 or q_fp8.shape[:2] != (1, 1):
++            raise RuntimeError(
++                "exact dense Indexer ablation requires q_fp8 shaped [1,1,64,D], "
++                f"got {tuple(q_fp8.shape)}"
++            )
++        if weights.shape != (1, q_fp8.shape[2]):
++            raise RuntimeError(
++                "exact dense Indexer ablation requires weights shaped [1,64], "
++                f"got {tuple(weights.shape)}"
++            )
++
++        seq_len = int(seqlens_32.reshape(-1)[0].item())
++        page_table = metadata.get_page_table_64()[:1]
++        k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
++            layer_id, seq_len, page_table[0]
++        )
++        k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
++            layer_id, seq_len, page_table[0]
++        )
++        k_dtype = (
++            torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
++        )
++        key = (
++            k_fp8.view(k_dtype).float()
++            * k_scale.view(torch.float32).squeeze(-1).unsqueeze(-1)
++        )
++        raw_qk = torch.matmul(q_fp8[0, 0].float(), key.transpose(0, 1))
++        # The per-head chunk16 selector ranks raw QK.  ReLU is applied only
++        # when reproducing the production 64-head merged DSA score.
++        per_indexer_score = raw_qk
++        merged_score = (
++            torch.relu(raw_qk) * weights[0].float().unsqueeze(-1)
++        ).sum(dim=0)
++
++        per_indexer_ids = {}
++        merged_ids = {}
++        for budget in (720, 2048):
++            k = min(budget, seq_len)
++            per_indexer_ids[budget] = per_indexer_score.topk(
++                k, dim=-1, largest=True, sorted=False
++            ).indices.unsqueeze(0)
++            merged_ids[budget] = merged_score.topk(
++                k, largest=True, sorted=False
++            ).indices.unsqueeze(0)
++
++        chunk_size = 16
++        chunks = (seq_len + chunk_size - 1) // chunk_size
++        padded_len = chunks * chunk_size
++        raw_qk_padded = torch.full(
++            (raw_qk.shape[0], padded_len),
++            -torch.inf,
++            dtype=raw_qk.dtype,
++            device=raw_qk.device,
++        )
++        raw_qk_padded[:, :seq_len] = raw_qk
++        qk_blocks = raw_qk_padded.view(raw_qk.shape[0], chunks, chunk_size)
++        chunk_counts = torch.full(
++            (chunks,), chunk_size, dtype=torch.float32, device=raw_qk.device
++        )
++        chunk_counts[-1] = seq_len - (chunks - 1) * chunk_size
++        finite_qk = torch.where(
++            torch.isfinite(qk_blocks), qk_blocks, torch.zeros_like(qk_blocks)
++        )
++        mean_chunk_score = finite_qk.sum(dim=-1) / chunk_counts.unsqueeze(0)
++
++        key_min_pad = torch.full(
++            (padded_len, key.shape[1]),
++            torch.inf,
++            dtype=key.dtype,
++            device=key.device,
++        )
++        key_max_pad = torch.full_like(key_min_pad, -torch.inf)
++        key_min_pad[:seq_len] = key
++        key_max_pad[:seq_len] = key
++        chunk_min = key_min_pad.view(chunks, chunk_size, -1).amin(dim=1)
++        chunk_max = key_max_pad.view(chunks, chunk_size, -1).amax(dim=1)
++        q = q_fp8[0, 0].float()
++        quest_chunk_score = torch.matmul(
++            torch.clamp_min(q, 0), chunk_max.transpose(0, 1)
++        ) + torch.matmul(
++            torch.clamp_max(q, 0), chunk_min.transpose(0, 1)
++        )
++
++        def quota_ids(
++            chunk_score: torch.Tensor,
++            selected_chunks: int,
++            dense_chunks: int,
++        ) -> torch.Tensor:
++            ranked_score = chunk_score.clone()
++            ranked_score[:, 0] = torch.finfo(ranked_score.dtype).max
++            if chunks > 1:
++                ranked_score[:, -1] = (
++                    torch.finfo(ranked_score.dtype).max / 2
++                )
++            selected = ranked_score.topk(
++                selected_chunks, dim=-1, largest=True, sorted=True
++            ).indices
++            selected_qk = qk_blocks.gather(
++                1, selected.unsqueeze(-1).expand(-1, -1, chunk_size)
++            )
++            relative = selected_qk.topk(
++                8, dim=-1, largest=True, sorted=False
++            ).indices
++            token_ids = selected.unsqueeze(-1) * chunk_size + relative
++            dense = token_ids[:, :dense_chunks, :8].reshape(
++                token_ids.shape[0], -1
++            )
++            sparse = token_ids[:, dense_chunks:, :4].reshape(
++                token_ids.shape[0], -1
++            )
++            result = torch.cat([dense, sparse], dim=-1)
++            return result.masked_fill(result >= seq_len, -1)
++
++        fixed_chunks = min(_per_head_paged.SEL, chunks)
++        fixed_dense = min(_per_head_paged.NDENSE, fixed_chunks)
++        per_indexer_ablation_ids = {
++            "mean_fixed_128_quota_52x8_76x4": quota_ids(
++                mean_chunk_score, fixed_chunks, fixed_dense
++            ).unsqueeze(0),
++            "quest_fixed_128_quota_52x8_76x4": quota_ids(
++                quest_chunk_score, fixed_chunks, fixed_dense
++            ).unsqueeze(0),
++        }
++        shared_ablation_ids = {}
++        ablation_stats = {}
++        for fraction in (0.05, 0.10):
++            candidate_chunks = min(
++                chunks, max(1, math.ceil(chunks * fraction))
++            )
++            quest_ranked_score = quest_chunk_score.clone()
++            quest_ranked_score[:, 0] = torch.finfo(
++                quest_ranked_score.dtype
++            ).max
++            if chunks > 1:
++                quest_ranked_score[:, -1] = (
++                    torch.finfo(quest_ranked_score.dtype).max / 2
++                )
++            candidate_ids = quest_ranked_score.topk(
++                candidate_chunks, dim=-1, largest=True, sorted=False
++            ).indices
++            candidate_mask = torch.zeros_like(
++                quest_chunk_score, dtype=torch.bool
++            )
++            candidate_mask.scatter_(1, candidate_ids, True)
++            candidate_mean_score = mean_chunk_score.masked_fill(
++                ~candidate_mask, -torch.inf
++            )
++            final_ids = quota_ids(
++                candidate_mean_score, fixed_chunks, fixed_dense
++            )
++            prefix = f"quest_{int(fraction * 100)}pct_then_mean"
++            per_indexer_ablation_ids[
++                f"{prefix}_fixed128_quota_top720"
++            ] = final_ids.unsqueeze(0)
++
++            candidate_qk = qk_blocks.gather(
++                1,
++                candidate_ids.unsqueeze(-1).expand(-1, -1, chunk_size),
++            ).reshape(raw_qk.shape[0], -1)
++            candidate_token_ids = (
++                candidate_ids.unsqueeze(-1) * chunk_size
++                + torch.arange(
++                    chunk_size, device=raw_qk.device
++                ).view(1, 1, -1)
++            ).reshape(raw_qk.shape[0], -1)
++            hard_topk_slots = candidate_qk.topk(
++                min(_per_head_paged.OUTK, candidate_qk.shape[-1]),
++                dim=-1,
++                largest=True,
++                sorted=False,
++            ).indices
++            hard_topk_ids = candidate_token_ids.gather(1, hard_topk_slots)
++            per_indexer_ablation_ids[
++                f"quest_{int(fraction * 100)}pct_all_keys_hard_top720"
++            ] = hard_topk_ids.unsqueeze(0)
++
++            if fraction == 0.10:
++                mean_ranked_score = mean_chunk_score.clone()
++                mean_ranked_score[:, 0] = torch.finfo(
++                    mean_ranked_score.dtype
++                ).max
++                if chunks > 1:
++                    mean_ranked_score[:, -1] = (
++                        torch.finfo(mean_ranked_score.dtype).max / 2
++                    )
++                mean_candidate_ids = mean_ranked_score.topk(
++                    candidate_chunks, dim=-1, largest=True, sorted=False
++                ).indices
++                mean_candidate_qk = qk_blocks.gather(
++                    1,
++                    mean_candidate_ids.unsqueeze(-1).expand(
++                        -1, -1, chunk_size
++                    ),
++                ).reshape(raw_qk.shape[0], -1)
++                mean_candidate_token_ids = (
++                    mean_candidate_ids.unsqueeze(-1) * chunk_size
++                    + torch.arange(
++                        chunk_size, device=raw_qk.device
++                    ).view(1, 1, -1)
++                ).reshape(raw_qk.shape[0], -1)
++                mean_hard_slots = mean_candidate_qk.topk(
++                    min(
++                        _per_head_paged.OUTK,
++                        mean_candidate_qk.shape[-1],
++                    ),
++                    dim=-1,
++                    largest=True,
++                    sorted=False,
++                ).indices
++                per_indexer_ablation_ids[
++                    "mean_10pct_all_keys_hard_top720"
++                ] = mean_candidate_token_ids.gather(
++                    1, mean_hard_slots
++                ).unsqueeze(0)
++
++            ablation_stats[f"{prefix}_candidate_chunks_per_head"] = float(
++                candidate_chunks
++            )
++            ablation_stats[f"{prefix}_candidate_chunk_fraction"] = float(
++                candidate_chunks / chunks
++            )
++        return (
++            per_indexer_ids,
++            merged_ids,
++            per_indexer_ablation_ids,
++            shared_ablation_ids,
++            ablation_stats,
++        )
++
++
+     def _prepare_group16_all64_probe(
+         self,
+         forward_batch: ForwardBatch,
+@@ -898,10 +1344,46 @@ class Indexer(MultiPlatformOp):
+             coarse_block_size=_headmap_probe.pooling_block_size(),
+             mean_ranked_chunks=_headmap_probe.prune_topk() is not None,
+         )
++        selected_indexer_head_id, selected_indexer_exact_top720_recall = (
++            self._probe_selected_indexer_exact_top720_recall(
++                forward_batch,
++                layer_id,
++                q_fp8,
++                metadata,
++                seqlens_32,
++                selection.candidate_head_ids,
++                picks,
++            )
++        )
++        (
++            exact_indexer_topk_ids,
++            exact_merged_topk_ids,
++            selector_ablation_per_indexer_ids,
++            selector_ablation_shared_ids,
++            selector_ablation_stats,
++        ) = self._probe_exact_dense_indexer_topk(
++            forward_batch,
++            layer_id,
++            q_fp8,
++            weights,
++            metadata,
++            seqlens_32,
++        )
+         _headmap_probe.put_picks(
+             layer_id,
+             picks,
+             request_id=identity.request_id,
++            selected_indexer_head_id=selected_indexer_head_id,
++            selected_indexer_exact_top720_recall=(
++                selected_indexer_exact_top720_recall
++            ),
++            exact_indexer_topk_ids=exact_indexer_topk_ids,
++            exact_merged_topk_ids=exact_merged_topk_ids,
++            selector_ablation_per_indexer_ids=(
++                selector_ablation_per_indexer_ids
++            ),
++            selector_ablation_shared_ids=selector_ablation_shared_ids,
++            selector_ablation_stats=selector_ablation_stats,
+             all_indexer_q=raw_query,
+             all_indexer_gate=raw_gate,
+             candidate_head_ids=selection.candidate_head_ids,
+@@ -930,6 +1412,15 @@ class Indexer(MultiPlatformOp):
+         if TYPE_CHECKING:
+             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+ 
++        if _is_cuda and get_adaptive_hisa_config().mode == "adaptive_decode":
++            from sglang.srt.layers.attention.nsa.adaptive_hisa.decode_runtime import maybe_decode_topk
++
++            adaptive_result = maybe_decode_topk(
++                forward_batch, layer_id, q_fp8, weights, metadata, self.index_topk
++            )
++            if adaptive_result is not None:
++                return adaptive_result
++
+         per_head_enabled = _per_head_paged.per_head_index_enabled() and not _is_hip
+         router_heads = (
+             _offline_router.candidate_head_ids(layer_id) if not _is_hip else None
+@@ -1465,7 +1956,7 @@ class Indexer(MultiPlatformOp):
+                 segments.append((start, start + n, b))
+                 start += n
+ 
+-            return self._per_head_ragged_topk(
++            topk_result = self._per_head_ragged_topk(
+                 forward_batch,
+                 layer_id,
+                 q_fp8,
+@@ -1477,6 +1968,8 @@ class Indexer(MultiPlatformOp):
+                 router_heads=router_heads,
+                 router_uses_misa=router_uses_misa,
+             )
++            # Experimental per-head/MISA index: no shared K, so no partition.
++            return topk_result
+ 
+         topk_result = torch.full(
+             (token_nums, self.index_topk),
+@@ -1510,11 +2003,32 @@ class Indexer(MultiPlatformOp):
+         token_to_batch_idx = metadata.get_token_to_batch_idx()
+         q_offset = ks.shape[0]
+         k_offset = k_fp8.shape[0]
+-
++        build_partition = partition_enabled()
++        reuse_partition_logits = (
++            build_partition
++            and not _is_hip
++            and partition_reuse_logits_enabled()
++        )
++        prepared_partition = (
++            _prepare_adaptive_partition(
++                forward_batch, layer_id, max_tokens=k_offset
++            )
++            if reuse_partition_logits
++            else None
++        )
++        append_calibration = (
++            prepared_partition is not None
++            and prepared_partition.n_complete > 0
++        )
+ 
+         # Baseline DSA: use one logits call when memory allows, otherwise run
+         # the same algorithm in row chunks.
+-        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
++        scorer_rows = q_offset + (
++            prepared_partition.q.shape[0] if append_calibration else 0
++        )
++        need_chunk, free_mem = self._should_chunk_mqa_logits(
++            scorer_rows, k_offset, device
++        )
+ 
+         if not need_chunk:
+             assert q_fp8[:q_offset].shape[0] != 0
+@@ -1525,12 +2039,49 @@ class Indexer(MultiPlatformOp):
+                     kv, scale = kv_fp8
+                     logits = fp8_mqa_logits(q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke)
+                 else:
+-                    logits = deep_gemm.fp8_mqa_logits(q_fp8[:q_offset], kv_fp8, weights[:q_offset], ks, ke, clean_logits=False)
++                    logits_q, logits_w, logits_ks, logits_ke = (
++                        _append_adaptive_calibration_rows(
++                            q_fp8[:q_offset],
++                            weights[:q_offset],
++                            ks,
++                            ke,
++                            prepared_partition if append_calibration else None,
++                        )
++                    )
++                    logits = deep_gemm.fp8_mqa_logits(
++                        logits_q,
++                        kv_fp8,
++                        logits_w,
++                        logits_ks,
++                        logits_ke,
++                        clean_logits=False,
++                    )
+ 
+-            assert logits.shape[0] == len(seq_lens_expanded)
++            official_logits = logits[:q_offset]
++            assert official_logits.shape[0] == len(seq_lens_expanded)
+             assert logits.shape[1] == k_offset
+-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
++            raw_topk_result = metadata.topk_transform(
++                official_logits, self.index_topk, ks=ks
++            )
+             topk_result[:q_offset] = raw_topk_result
++            if append_calibration:
++                _schedule_adaptive_partition_scores(
++                    prepared_partition,
++                    logits[
++                        q_offset : q_offset + prepared_partition.q.shape[0],
++                        : prepared_partition.n_complete,
++                    ],
++                    forward_batch,
++                    k_fp8,
++                    k_scale,
++                    self.scale_fmt,
++                )
++            elif build_partition and (
++                not reuse_partition_logits or prepared_partition is not None
++            ):
++                _schedule_adaptive_partition(
++                    forward_batch, layer_id, k_fp8, k_scale, self.scale_fmt
++                )
+             return topk_result
+ 
+         # Chunk path
+@@ -1539,6 +2090,8 @@ class Indexer(MultiPlatformOp):
+         # Reserve 50% of free memory for logits
+         max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+         max_rows = min(max_rows, q_offset)
++        if append_calibration:
++            max_rows = max(1, max_rows - prepared_partition.q.shape[0])
+ 
+         global_topk_offset = metadata.attn_metadata.topk_indices_offset
+ 
+@@ -1551,8 +2104,10 @@ class Indexer(MultiPlatformOp):
+             ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+ 
+         start = 0
++        calibration_scores = None
+         while start < q_offset:
+             end = min(start + max_rows, q_offset)
++            last_chunk = end == q_offset
+ 
+             with self._with_real_sm_count():
+                 if _is_hip:
+@@ -1569,15 +2124,36 @@ class Indexer(MultiPlatformOp):
+                     )
+ 
+                 else:
++                    logits_q, logits_w, logits_ks, logits_ke = (
++                        _append_adaptive_calibration_rows(
++                            q_fp8[start:end],
++                            weights[start:end],
++                            ks[start:end],
++                            ke[start:end],
++                            (
++                                prepared_partition
++                                if append_calibration and last_chunk
++                                else None
++                            ),
++                        )
++                    )
+                     logits_chunk = deep_gemm.fp8_mqa_logits(
+-                        q_fp8[start:end],
++                        logits_q,
+                         kv_fp8,
+-                        weights[start:end],
+-                        ks[start:end],
+-                        ke[start:end],
++                        logits_w,
++                        logits_ks,
++                        logits_ke,
+                         clean_logits=False,
+                     )
+ 
++            official_rows = end - start
++            if append_calibration and last_chunk:
++                calibration_scores = logits_chunk[
++                    official_rows : official_rows
++                    + prepared_partition.q.shape[0],
++                    : prepared_partition.n_complete,
++                ]
++            official_logits_chunk = logits_chunk[:official_rows]
+             lengths_chunk = seq_lens_expanded[start:end]
+ 
+             # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
+@@ -1589,14 +2165,14 @@ class Indexer(MultiPlatformOp):
+             else:
+                 # PAGED path: treat each token as a length-1 sequence
+                 topk_offset_chunk = None
+-                B_chunk = logits_chunk.shape[0]
++                B_chunk = official_logits_chunk.shape[0]
+                 cu_seqlens_q_chunk = torch.ones(
+                     B_chunk, dtype=torch.int32, device=device
+                 )
+                 batch_idx_chunk = token_to_batch_idx[start:end]
+ 
+             raw_topk_chunk = metadata.topk_transform(
+-                logits_chunk,
++                official_logits_chunk,
+                 self.index_topk,
+                 ks=ks[start:end],
+                 cu_seqlens_q=cu_seqlens_q_chunk,
+@@ -1607,6 +2183,21 @@ class Indexer(MultiPlatformOp):
+             topk_result[start:end] = raw_topk_chunk
+             start = end
+ 
++        if calibration_scores is not None:
++            _schedule_adaptive_partition_scores(
++                prepared_partition,
++                calibration_scores,
++                forward_batch,
++                k_fp8,
++                k_scale,
++                self.scale_fmt,
++            )
++        elif build_partition and (
++            not reuse_partition_logits or prepared_partition is not None
++        ):
++            _schedule_adaptive_partition(
++                forward_batch, layer_id, k_fp8, k_scale, self.scale_fmt
++            )
+         return topk_result
+ 
+ 
+@@ -1641,6 +2232,7 @@ class Indexer(MultiPlatformOp):
+             key=key,
+             act_quant=act_quant,
+         )
++        _skip_adaptive_partition(forward_batch, layer_id, "k_only_no_query")
+ 
+         # MHA doesn't need topk_indices
+         if not return_indices:
+@@ -2145,6 +2737,22 @@ class Indexer(MultiPlatformOp):
+                 x_for_gate, q_scale
+             )
+ 
++        if _indexer_dump.enabled():
++            _indexer_dump.maybe_dump(
++                forward_batch=forward_batch,
++                layer_id=layer_id,
++                positions=positions,
++                key_bf16=key,
++                q_fp8=q_fp8,
++                q_scale=q_scale,
++                weights=weights,
++                act_quant=act_quant,
++                block_size=self.block_size,
++                scale_fmt=self.scale_fmt,
++            )
++
++        _note_adaptive_queries(forward_batch, layer_id, q_fp8, weights)
++
+         if _is_cuda or _is_hip:
+             assert forward_batch.seq_lens_cpu is not None
+             if len(forward_batch.seq_lens_cpu) == 0:
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index ecb909d38..0b45c896b 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -59,6 +59,7 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+ from sglang.srt.dllm.mixin.req import ReqDllmMixin
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
++from sglang.srt.layers.attention.nsa.adaptive_hisa.config import partition_enabled
+ from sglang.srt.managers.embed_types import PositionalEmbeds
+ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
+@@ -2543,6 +2544,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         seq_lens_cpu = (
+             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
+         )
++        prefill_final_cpu = prefill_new_tokens_cpu = None
++        if self.forward_mode.is_extend() and partition_enabled():
++            from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++                partition_request_flags,
++            )
++
++            seq_list = (
++                [int(v) for v in seq_lens_cpu.tolist()]
++                if seq_lens_cpu is not None
++                else [0] * len(self.reqs)
++            )
++            prefill_final_cpu, prefill_new_tokens_cpu = partition_request_flags(
++                self.reqs,
++                self.chunked_req,
++                is_extend=(
++                    self.forward_mode.is_extend_without_speculative()
++                    and not self.forward_mode.is_split_prefill()
++                    and not self.is_dllm()
++                ),
++                seq_lens=seq_list,
++            )
+ 
+         return ModelWorkerBatch(
+             forward_mode=self.forward_mode,
+@@ -2606,6 +2628,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             mamba_track_indices=self.mamba_track_indices,
+             mamba_track_mask=self.mamba_track_mask,
+             mamba_track_seqlens=self.mamba_track_seqlens,
++            prefill_final_cpu=prefill_final_cpu,
++            prefill_new_tokens_cpu=prefill_new_tokens_cpu,
+         )
+ 
+     def copy(self):
+@@ -2844,3 +2868,8 @@ class ModelWorkerBatch:
+     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
++
++    # Scheduler-owned Adaptive-HISA flags. True only for a prompt that finishes
++    # in this extend; never inferred from token positions inside the model.
++    prefill_final_cpu: Optional[List[bool]] = None
++    prefill_new_tokens_cpu: Optional[List[int]] = None
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 1dc08b388..9c984f5e9 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -41,6 +41,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.nsa import index_buf_accessor
++from sglang.srt.layers.attention.nsa.adaptive_hisa.config import partition_enabled
+ from sglang.srt.layers.attention.nsa.quant_k_cache import (
+     quantize_k_cache,
+     quantize_k_cache_separate,
+@@ -184,8 +185,18 @@ class ReqToTokenPool:
+ 
+     def free(self, req: Req):
+         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+-        self.free_slots.append(req.req_pool_idx)
++        req_idx = req.req_pool_idx
++        self.free_slots.append(req_idx)
+         req.req_pool_idx = None
++        if partition_enabled():
++            try:
++                from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++                    release_request,
++                )
++
++                release_request(req_idx)
++            except Exception:
++                logger.exception("failed to release adaptive-hisa request state")
+ 
+     def clear(self):
+         self.free_slots = list(range(1, self._alloc_size))
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 00ca12fff..08af456fb 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -747,6 +747,14 @@ class CudaGraphRunner:
+         return "nolora"
+ 
+     def can_run(self, forward_batch: ForwardBatch):
++        from sglang.srt.layers.attention.nsa.adaptive_hisa.config import get_config
++
++        adaptive_decode = get_config().mode == "adaptive_decode"
++        if adaptive_decode:
++            from sglang.srt.layers.attention.nsa.adaptive_hisa.decode_runtime import allow_cuda_graph
++
++            if not allow_cuda_graph(forward_batch):
++                return False
+         # Disable for token embedding overrides (dynamic per-request)
+         if forward_batch.replace_embeds is not None:
+             return False
+@@ -767,7 +775,7 @@ class CudaGraphRunner:
+ 
+         is_bs_supported = (
+             graph_key in self.graphs
+-            if self.disable_padding
++            if self.disable_padding or adaptive_decode
+             else cuda_graph_bs <= self.max_bs
+         )
+ 
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 9a4a7cf58..3082d6c79 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -444,6 +444,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+     # For dumper: request IDs for cross-step sequence tracking
+     rids: Optional[List[str]] = None
+ 
++    # Scheduler-owned last prefill chunk, plus tokens computed outside radix cache.
++    prefill_final_cpu: Optional[List[bool]] = None
++    # Host request slots avoid a synchronizing GPU .item() in decode admission.
++    req_pool_indices_cpu: Optional[List[int]] = None
++    prefill_new_tokens_cpu: Optional[List[int]] = None
++
+     @classmethod
+     def init_new(
+         cls,
+@@ -495,6 +501,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+             return_pooled_hidden_states=batch.return_pooled_hidden_states,
+             rids=[req.rid for req in batch.reqs],
++            prefill_final_cpu=getattr(batch, "prefill_final_cpu", None),
++            req_pool_indices_cpu=[req.req_pool_idx for req in batch.reqs],
++            prefill_new_tokens_cpu=getattr(batch, "prefill_new_tokens_cpu", None),
+         )
+         device = model_runner.device
+ 
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 4fe964ca3..dcba0944c 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -2001,6 +2001,36 @@ class DeepseekV2DecoderLayer(nn.Module):
+         return output
+ 
+ 
++def _begin_adaptive_partitions(forward_batch) -> None:
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.config import (
++        forward_timing_enabled,
++        partition_enabled,
++    )
++
++    if not (partition_enabled() or forward_timing_enabled()):
++        return
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++        begin_forward,
++    )
++
++    begin_forward(forward_batch)
++
++
++def _finish_adaptive_partitions() -> None:
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.config import (
++        forward_timing_enabled,
++        partition_enabled,
++    )
++
++    if not (partition_enabled() or forward_timing_enabled()):
++        return
++    from sglang.srt.layers.attention.nsa.adaptive_hisa.prefill_runtime import (
++        finish_prefill_partitions,
++    )
++
++    finish_prefill_partitions()
++
++
+ class DeepseekV2Model(nn.Module):
+     fall_back_to_pt_during_load = False
+ 
+@@ -2142,6 +2172,7 @@ class DeepseekV2Model(nn.Module):
+         input_embeds: torch.Tensor = None,
+         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+     ) -> Union[torch.Tensor, PPProxyTensors]:
++        _begin_adaptive_partitions(forward_batch)
+         total_num_layers = self.end_layer - self.start_layer
+         if self.pp_group.is_first_rank:
+             if input_embeds is None:
+@@ -2247,6 +2278,7 @@ class DeepseekV2Model(nn.Module):
+             )
+ 
+         if not self.pp_group.is_last_rank:
++            _finish_adaptive_partitions()
+             return PPProxyTensors(
+                 {
+                     "hidden_states": hidden_states,
+@@ -2269,7 +2301,9 @@ class DeepseekV2Model(nn.Module):
+                 torch.cuda.current_stream(),
+             )
+         if len(aux_hidden_states) == 0:
++            _finish_adaptive_partitions()
+             return hidden_states
++        _finish_adaptive_partitions()
+         return hidden_states, aux_hidden_states
+ 
+ 
