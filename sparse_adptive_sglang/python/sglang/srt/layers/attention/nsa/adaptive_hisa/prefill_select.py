@@ -16,7 +16,7 @@ the same two-level scheme the decode path uses, batched over query rows:
 1. coarse   ``[n_q, capacity]`` = fp8_mqa_logits(q, summaries); leaves that
             start in ``[0, sink_tokens)`` are forced to the top (attention sink)
 2. select   per row: leaves in descending coarse score until
-            ``candidate_tokens`` raw tokens (the crossing leaf is clipped)
+            ``prefill_candidate_tokens`` raw tokens (the crossing leaf is clipped)
 3. local    every row also gets its causal local window
             ``[n_complete, pos]`` (the current chunk + unsealed tail), which is
             what the decode path calls sink/tail
@@ -31,7 +31,7 @@ CPU keeps running ahead of the GPU exactly as in the dense path.
 
 Admission (else the caller falls back to the dense DSA path):
 * B=1 extend, no capture / spec / CP / PP (same as the partition builder)
-* a summary entry of the current epoch with ``candidate_tokens <= n_complete
+* a summary entry of the current epoch with ``prefill_candidate_tokens <= n_complete
   <= chunk_start`` (chunk 0 and 1 are dense; the leaf budget always fills)
 * unfused ragged Top-K output (``SGLANG_NSA_FUSE_TOPK=0`` or forced unfused)
 """
@@ -73,11 +73,25 @@ def _fused_topk_requested(metadata) -> bool:
     )
 
 
+def _is_final_chunk(forward_batch) -> bool:
+    final = getattr(forward_batch, "prefill_final_cpu", None)
+    return bool(final) and bool(final[0])
+
+
 def sparse_prefill_admission(forward_batch, layer_id: int, metadata) -> tuple | None:
-    """Return ``(cfg, entry, chunk_start, seq_len)`` or ``None`` (dense path)."""
+    """Return ``(cfg, entry, chunk_start, seq_len, budget)`` or ``None`` (dense path).
+
+    The final prompt chunk produces the first output token, so it gets its own
+    treatment: ``sparse_prefill_dense_final`` keeps the dense DSA indexer for
+    it, ``sparse_prefill_final_candidates`` gives it a larger leaf budget.
+    """
     cfg = get_config()
     if not cfg.sparse_prefill or not cfg.enabled or not wants_layer(layer_id):
         return None
+    final = _is_final_chunk(forward_batch)
+    if final and cfg.sparse_prefill_dense_final:
+        return None
+    budget = cfg.final_candidate_tokens if final else cfg.prefill_candidate_tokens
     from .prefill_runtime import STATE, _admission_skip, get_summary_entry
 
     if _admission_skip(forward_batch) is not None:
@@ -96,9 +110,9 @@ def sparse_prefill_admission(forward_batch, layer_id: int, metadata) -> tuple | 
     seq_len = int(forward_batch.seq_lens_cpu[0])
     extend = int(forward_batch.extend_seq_lens_cpu[0])
     chunk_start = seq_len - extend
-    if extend <= 0 or entry.n_complete < cfg.candidate_tokens or entry.n_complete > chunk_start:
+    if extend <= 0 or entry.n_complete < budget or entry.n_complete > chunk_start:
         return None
-    return cfg, entry, chunk_start, seq_len
+    return cfg, entry, chunk_start, seq_len, budget
 
 
 def _summary_kv(pool, entry) -> tuple[torch.Tensor, torch.Tensor]:
@@ -227,7 +241,7 @@ def sparse_prefill_topk(
 
     from .summary_pool import get_summary_pool
 
-    cfg, entry, chunk_start, seq_len = admission
+    cfg, entry, chunk_start, seq_len, budget = admission
     device = q_fp8.device
     if entry.ready_event is not None:
         torch.cuda.current_stream(device).wait_event(entry.ready_event)
@@ -238,14 +252,14 @@ def sparse_prefill_topk(
     out = sparse_topk_core(
         q_fp8, weights, seq_lens_expanded, raw_pages, block_tables[:1],
         keys, scales, part.leaf_start[: entry.capacity], part.leaf_len[: entry.capacity],
-        part.num_leaves, int(entry.n_complete), seq_len, cfg, k_flat=k_flat,
+        part.num_leaves, int(entry.n_complete), seq_len, cfg, k_flat=k_flat, budget=budget,
     )
     _note(
         ("first", layer_id),
         "adaptive-hisa sparse prefill layer=%d rows=%d n_complete=%d chunk_start=%d "
-        "seq_len=%d capacity=%d budget=%d rows_per_step=%d",
+        "seq_len=%d capacity=%d budget=%d rows_per_step=%d final=%d",
         layer_id, q_fp8.shape[0], entry.n_complete, chunk_start, seq_len, entry.capacity,
-        cfg.candidate_tokens, cfg.sparse_prefill_rows,
+        budget, cfg.sparse_prefill_rows, _is_final_chunk(forward_batch),
     )
     return out
 
@@ -266,6 +280,7 @@ def sparse_topk_core(
     cfg,
     k_flat: tuple[torch.Tensor, torch.Tensor] | None = None,  # optional flat (fp8 [>=seq_len,128], fp32 [>=seq_len])
     dense_local: bool = True,
+    budget: int | None = None,      # leaf-token budget; default cfg.prefill_candidate_tokens
 ) -> torch.Tensor:
     """Two-level Top-K for one chunk of queries (see module docstring).
 
@@ -289,7 +304,7 @@ def sparse_topk_core(
     order, incl = rank_leaves(coarse, leaf_start, leaf_len)
     del coarse
 
-    budget = int(cfg.candidate_tokens)
+    budget = int(cfg.prefill_candidate_tokens if budget is None else budget)
     n_complete = int(n_complete)
     local_len = int(seq_len) - n_complete  # last row's window; shorter rows mask
     raw_pages = raw_pages.view(-1, 64, 1, raw_pages.shape[-1] // 64)

@@ -71,6 +71,98 @@ adaptive 在每个 (layer, chunk) 上都 ≥ hisa64，但优势很小（+0.5–1
 没有 sink 的首版 e2e 跑了 61 条 LongBench 后停掉（`data/..._nosink_partial/`）：同 61 条上 0.410 vs DSA/P-key 0.508，
 2 胜 6 负；带 sink 的版本重新跑。
 
+### 叶子预算（`SPARSE_PREFILL_CANDIDATES`）
+
+prefill 的 fine 阶段按 8192 行摊销，预算翻倍只多 ~16 ms/层/chunk，但 recall 提升明显（sink=64）：
+
+| dump | 预算 | prefix recall | overall recall | mass |
+|---|---:|---:|---:|---:|
+| ruler cwe 128K（L10/L30 × 14 chunk） | 8192 | 0.771 | 0.886 | 0.920 |
+| | 16384 | 0.888 | 0.945 | 0.940 |
+| lbv2 short-hard 33K（L3/10/30/45 × chunk 2–4） | 8192 | 0.765 | 0.832 | 0.955 |
+| | 16384 | 0.937 | 0.949 | 0.986 |
+
+hisa64 在同预算下低 0.1–0.5 pp。因此加了独立的 prefill 预算 `SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_CANDIDATES`
+（0 = 沿用 decode 的 `CANDIDATE_TOKENS`），e2e 第二个 arm `sparse_prefill_c16k` 用 16384。
+
+## e2e 精度（runner `runner/run_sparse_prefill_e2e.py --arm ...`，`data/adaptive_0921_h202_sparse_prefill_e2e_20260921/`）
+
+LongBench v2 held-out 401 条（同一子集），arm `sparse_prefill`（预算 8192，sink 64）：
+
+| | 总体 | short | medium | long | easy | hard |
+|---|---:|---:|---:|---:|---:|---:|
+| 官方 DSA（0913 hist） | 0.504 | 0.507 | 0.525 | 0.446 | | |
+| P-key decode-only（h201，0920） | 0.501 | 0.493 | 0.519 | 0.473 | | |
+| **sparse_prefill 8192** | **0.479** | 0.486 | 0.481 | 0.459 | 0.518 | 0.458 |
+
+相对 P-key decode-only −2.2 pp（10 胜 19 负），相对 DSA −2.5 pp。
+
+RULER（同一 held-out 364 条 = 13 任务 × 2 长度 × 14，arm `sparse_prefill` 8192，已完成）：
+
+| | 总体 | 32k | 128k |
+|---|---:|---:|---:|
+| 官方 DSA | 0.847 | 0.872 | 0.821 |
+| P-key decode-only | 0.853 | 0.882 | 0.825 |
+| **sparse_prefill 8192** | **0.727** | 0.855 | **0.598** |
+
+差 ≥ 0.1 的任务（n=14/格；DSA / P-key / sparse_prefill）：
+
+| 任务 | DSA | P-key decode-only | sparse_prefill 8192 |
+|---|---:|---:|---:|
+| 128k niah_multikey_1 | 0.786 | 0.929 | **0.429** |
+| 128k niah_multikey_2 | 1.000 | 1.000 | **0.357** |
+| 128k niah_multikey_3 | 1.000 | 1.000 | **0.214** |
+| 128k niah_multiquery | 0.964 | 0.857 | 0.750 |
+| 128k niah_multivalue | 0.839 | 0.821 | 0.643 |
+| 128k niah_single_2 | 0.929 | 0.929 | **0.500** |
+| 128k niah_single_3 | 1.000 | 1.000 | 0.857 |
+| 128k qa_1 | 0.643 | 0.714 | 0.571 |
+| 32k niah_multikey_2 | 1.000 | 1.000 | 0.714 |
+
+其余任务（cwe/fwe/vt/qa_2、32k 的绝大多数）与 P-key decode-only 持平（±0.05）。128k cwe 三者是 0.664 / 0.450 / 0.471，
+这个损失来自 decode 侧，与 prefill 无关。
+
+**128K NIAH-multikey 崩了。** 原因：第一个输出 token 由最后一个 prefill chunk 的最后一行产生，
+它要在 128K 前缀里找 needle；decode-only 版本这一行走的是密集 DSA，decode 再用两级选择只是"抄写"。
+NIAH dump（`dump:ruler:niah_multikey_3:128k:0`，L3/10/30/45 × chunk 2–15，sink=64）上均值 summary 的 prefix recall 很低，
+haystack 是均匀重复文本，needle 所在叶子被均值稀释：
+
+| 预算 | prefix recall | overall | mass | L3 c15 prefix |
+|---:|---:|---:|---:|---:|
+| 8192 | 0.553 | 0.656 | 0.915 | 0.18 |
+| 16384 | 0.717 | 0.774 | 0.947 | 0.33 |
+| 32768 | 0.844 | 0.874 | 0.976 | 0.58 |
+
+（hisa64 固定块同预算低 0.3–0.5 pp，同样中招。）
+
+### 最后一个 chunk 的特殊处理
+
+新增两个开关（`config.py`，`prefill_select.sparse_prefill_admission` 用 `forward_batch.prefill_final_cpu` 判断最后 chunk）：
+
+- `SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_DENSE_FINAL=1`：最后一个 chunk 走密集 DSA indexer，中间 chunk 仍稀疏；
+- `SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_FINAL_CANDIDATES=32768`：最后一个 chunk 用更大的叶子预算。
+
+单层单 chunk 耗时（128K，8192 行，GPU 与 e2e 共享，看相对值）：预算 8192 → 25 ms，16384 → 38 ms，32768 → 64 ms，密集 ≈ 190 ms。
+`final32k` 只多最后一个 chunk 的 ~40 ms/层，几乎免费；`dense_final` 退回最后一个（最长的）chunk 的密集代价，
+约为密集 indexer 总量的 1/8（128K 上 ~1.5–2 s TTFT）。
+
+runner 加了 `--quick-niah`（只跑 RULER 128k niah_multikey_1/2/3，42 条）；arm：
+`sparse_prefill_dense_final`、`sparse_prefill_final32k`、`sparse_prefill_c16k`、`sparse_prefill_c32k`，
+结果目录 `<arm>_quickniah/`，排在 8192 全量 RULER 之后跑。
+
+quick-NIAH 结果（128k，n=14/格）：
+
+| arm | mk_1 | mk_2 | mk_3 | 均值 |
+|---|---:|---:|---:|---:|
+| P-key decode-only（参照） | 0.929 | 1.000 | 1.000 | 0.976 |
+| sparse_prefill 8192（全 chunk 稀疏） | 0.429 | 0.357 | 0.214 | 0.333 |
+| **sparse_prefill_dense_final**（中间稀疏，最后 chunk 密集） | 0.714 | 0.929 | 0.929 | **0.857** |
+| sparse_prefill_c16k | 0.571 | （运行中） | | |
+| sparse_prefill_c32k / final32k | （排队中） | | | |
+
+`dense_final` 把 mk_2/mk_3 从 0.36/0.21 拉回 0.93，确认瓶颈主要在最后一个 chunk 的选择；
+剩下的 −12 pp（mk_1 0.71 vs 0.93）来自中间 chunk 稀疏造成的 KV 偏差。
+
 单元测试 `delta/test/registered/unit/test_adaptive_hisa_sparse_prefill.py`（6 个，GPU 上全部通过）：
 配置/环境变量、expand kernel 对 Python 参考、准入规则、Top-K 与"密集限制在候选集"一致、dense-local 与全稀疏一致。
 

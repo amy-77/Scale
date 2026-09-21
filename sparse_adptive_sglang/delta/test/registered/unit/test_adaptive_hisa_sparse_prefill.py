@@ -30,6 +30,14 @@ class TestSparsePrefillConfig(unittest.TestCase):
             cfg = config_from_env()
         self.assertTrue(cfg.sparse_prefill)
         self.assertEqual(cfg.sparse_prefill_rows, 512)
+        self.assertEqual(cfg.prefill_candidate_tokens, cfg.candidate_tokens)  # 0 -> decode budget
+        env['SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_CANDIDATES'] = '16384'
+        with patch.dict('os.environ', env, clear=False):
+            cfg = config_from_env()
+        self.assertEqual(cfg.prefill_candidate_tokens, 16384)
+        self.assertNotEqual(cfg.candidate_tokens, 16384)
+        with self.assertRaises(PartitionConfigError):
+            dataclasses.replace(cfg, sparse_prefill_candidates=1000).validate()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), 'expansion is a Triton kernel')
@@ -82,9 +90,10 @@ class TestExpandCandidates(unittest.TestCase):
 
 
 class TestAdmission(unittest.TestCase):
-    def _batch(self, seq_len=20000, extend=3616, bs=1):
+    def _batch(self, seq_len=20000, extend=3616, bs=1, final=False):
         return SimpleNamespace(
             batch_size=bs, seq_lens_cpu=torch.tensor([seq_len]), extend_seq_lens_cpu=torch.tensor([extend]),
+            prefill_final_cpu=[final],
             req_pool_indices_cpu=[3], req_pool_indices=torch.tensor([3]),
             forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True,
                                          is_split_prefill=lambda: False, is_dllm_extend=lambda: False),
@@ -103,7 +112,19 @@ class TestAdmission(unittest.TestCase):
             state.epoch.return_value = 0
             got = ps.sparse_prefill_admission(self._batch(), 5, meta)
             self.assertIsNotNone(got)
-            self.assertEqual(got[2:], (20000 - 3616, 20000))
+            self.assertEqual(got[2:], (20000 - 3616, 20000, cfg.candidate_tokens))
+            # final chunk: own budget, or dense when requested
+            final_cfg = dataclasses.replace(cfg, sparse_prefill_final_candidates=16384).validate()
+            with patch.object(ps, 'get_config', return_value=final_cfg):
+                self.assertEqual(ps.sparse_prefill_admission(self._batch(final=True), 5, meta)[4], 16384)
+                self.assertEqual(ps.sparse_prefill_admission(self._batch(), 5, meta)[4], cfg.candidate_tokens)
+                entry.n_complete = 16000  # final budget no longer fits -> dense for the final chunk only
+                self.assertIsNone(ps.sparse_prefill_admission(self._batch(final=True), 5, meta))
+                self.assertIsNotNone(ps.sparse_prefill_admission(self._batch(), 5, meta))
+                entry.n_complete = 16384
+            with patch.object(ps, 'get_config', return_value=dataclasses.replace(cfg, sparse_prefill_dense_final=True)):
+                self.assertIsNone(ps.sparse_prefill_admission(self._batch(final=True), 5, meta))
+                self.assertIsNotNone(ps.sparse_prefill_admission(self._batch(), 5, meta))
             # sealed prefix shorter than the candidate budget -> dense
             entry.n_complete = 8000
             self.assertIsNone(ps.sparse_prefill_admission(self._batch(), 5, meta))

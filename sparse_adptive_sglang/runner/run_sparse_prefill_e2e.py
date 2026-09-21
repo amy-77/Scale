@@ -26,7 +26,6 @@ from pathlib import Path
 ROOT = Path('/DATA/disk0/qyl')
 PACKAGE = ROOT / 'code/adaptive_0921_h202'
 OUT = ROOT / 'data/adaptive_0921_h202_sparse_prefill_e2e_20260921'
-FROZEN = OUT / 'source'
 CACHE = ROOT / 'cache/adaptive_0921_h202'
 EVALUATORS_SRC = ROOT / 'code/dpskv32'
 HELD = ROOT / 'data/static_group16_e2e_20260913/strict_heldout'
@@ -36,8 +35,28 @@ IMAGE = 'qyl/sglang-hisa:eval'
 MODEL = '/workspace/qyl/models/deepseek-v3.2'
 PORT = 31923
 CONTEXT_LEN = 163840
-ARM = 'sparse_prefill'
-NAME = 'adaptive-0921-h202-sparse-prefill-e2e'
+# --arm <name>: extra SGLANG_NSA_ADAPTIVE_HISA_* settings on top of the common env.
+#   sparse_prefill            prefill leaf budget = decode budget (8192), every chunk sparse
+#   sparse_prefill_c16k       prefill budget 16384
+#   sparse_prefill_c32k       prefill budget 32768
+#   sparse_prefill_final32k   8192 for intermediate chunks, 32768 for the final chunk
+#   sparse_prefill_dense_final intermediate chunks sparse (8192), final chunk dense DSA
+# --quick-niah: skip LongBench, RULER 128k niah_multikey_1/2/3 only (42 rows), output <arm>_quickniah/
+_ARMS = {
+    'sparse_prefill': {},
+    'sparse_prefill_c16k': {'SPARSE_PREFILL_CANDIDATES': '16384'},
+    'sparse_prefill_c32k': {'SPARSE_PREFILL_CANDIDATES': '32768'},
+    'sparse_prefill_final32k': {'SPARSE_PREFILL_FINAL_CANDIDATES': '32768'},
+    'sparse_prefill_dense_final': {'SPARSE_PREFILL_DENSE_FINAL': '1'},
+}
+_ARM_BASE = sys.argv[sys.argv.index('--arm') + 1] if '--arm' in sys.argv else 'sparse_prefill'
+if _ARM_BASE not in _ARMS:
+    raise SystemExit(f'unknown --arm {_ARM_BASE}; choose from {sorted(_ARMS)}')
+QUICK_NIAH = '--quick-niah' in sys.argv
+ARM = _ARM_BASE + ('_quickniah' if QUICK_NIAH else '')
+NAME = 'adaptive-0921-h202-' + ARM.replace('_', '-') + '-e2e'
+# first arm froze into OUT/source; later arms get their own frozen tree
+FROZEN = OUT / ('source' if ARM == 'sparse_prefill' else f'source_{ARM}')
 EXPECTED_METRIC = 'key_sse'
 EXPECTED_METHOD = 'P-key-sync_nonoverlap-target64'
 EXPECTED_DECODE_CHUNK = '64'
@@ -119,13 +138,13 @@ def freeze_source():
     for p in sorted(list(pkg.rglob('*.py')) + list(pkg.rglob('*.cu'))
                     + [FROZEN / 'python/sglang/srt/layers/attention/nsa/nsa_indexer.py']):
         shas[str(p.relative_to(FROZEN))] = hashlib.sha256(p.read_bytes()).hexdigest()
-    (OUT / 'source.sha256.json').write_text(json.dumps(shas, indent=2))
+    (FROZEN / 'source.sha256.json').write_text(json.dumps(shas, indent=2))
     prov = {
         'package': str(PACKAGE),
         'package_git_head': (PACKAGE / 'git_head.txt').read_text().strip() if (PACKAGE / 'git_head.txt').exists() else None,
         'frozen_utc': now(),
     }
-    (OUT / 'source_provenance.json').write_text(json.dumps(prov, indent=2))
+    (FROZEN / 'source_provenance.json').write_text(json.dumps(prov, indent=2))
     (OUT / 'evaluators').mkdir(exist_ok=True)
     for name in ('evaluate_longbench_v2_e2e.py', 'collect_longbench_v2.py',
                  'evaluate_ruler_e2e.py', 'collect_ruler.py'):
@@ -165,6 +184,7 @@ def server_env():
         'SGLANG_NSA_ADAPTIVE_HISA_FORWARD_TIMING': '0',
         'SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL': '1',
         'SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS': '2048',
+        **{'SGLANG_NSA_ADAPTIVE_HISA_' + k: v for k, v in _ARMS[_ARM_BASE].items()},
     }
 
 
@@ -287,7 +307,9 @@ def evaluate_ruler():
            '--output', cpath(dst / 'ruler_predictions.jsonl'),
            '--summary', cpath(dst / 'ruler_summary.json'),
            '--lengths', '32k', '128k', '--all-records', '--resume']
-    event('EVAL_START', bench='ruler')
+    if QUICK_NIAH:
+        cmd[cmd.index('--lengths'):cmd.index('--all-records')] = ['--lengths', '128k', '--tasks', 'niah_multikey_1', 'niah_multikey_2', 'niah_multikey_3']
+    event('EVAL_START', bench='ruler', quick_niah=QUICK_NIAH)
     run_eval(cmd, dst / 'ruler.log')
     s = json.loads((dst / 'ruler_summary.json').read_text())
     event('EVAL_DONE', bench='ruler', examples=s.get('examples'), successful=s.get('successful'),
@@ -328,7 +350,7 @@ def rows(path):
 
 
 def compare():
-    report = {'updated_utc': now(), 'benches': {}}
+    report = {'updated_utc': now(), 'arm': ARM, 'benches': {}}
     for bench, fname in (('longbench_v2', 'longbench_predictions.jsonl'), ('ruler', 'ruler_predictions.jsonl')):
         arm = rows(OUT / ARM / fname)
         entry = {'rows_sparse_prefill': len(arm), 'baselines': {}}
@@ -353,7 +375,7 @@ def compare():
                         e['by_' + field][value] = {'n': len(keys), 'acc_sparse_prefill': acc(arm, keys), 'acc_baseline': acc(base, keys)}
             entry['baselines'][label] = e
         report['benches'][bench] = entry
-    (OUT / 'comparison.json').write_text(json.dumps(report, indent=2))
+    (OUT / ARM / 'comparison.json').write_text(json.dumps(report, indent=2))
     return report
 
 
@@ -372,9 +394,10 @@ def main():
         start_server()
         status(arm=ARM, state='smoke')
         smoke()
-        status(arm=ARM, state='evaluating_longbench')
-        evaluate_longbench()
-        compare()
+        if not QUICK_NIAH:
+            status(arm=ARM, state='evaluating_longbench')
+            evaluate_longbench()
+            compare()
         status(arm=ARM, state='evaluating_ruler')
         evaluate_ruler()
         compare()

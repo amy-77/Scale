@@ -170,7 +170,25 @@ class PartitionConfig:
     # Query rows per sparse-prefill sub-batch (bounds the candidate/logit
     # workspaces: rows x (candidate_tokens + chunk) x 8 bytes).
     sparse_prefill_rows: int = 2048
+    # Raw-token leaf budget for the prefill two-level selection; 0 = use
+    # ``candidate_tokens`` (the decode budget). Prefill amortises the fine
+    # pass over 8192 query rows, so a larger budget is cheap there: on a 128K
+    # dump 16384 lifts Top-2048 recall 0.886 -> 0.945 for ~+16 ms/layer-chunk.
+    sparse_prefill_candidates: int = 0
+    # The final prompt chunk produces the first output token (RULER NIAH is
+    # decided there). ``dense_final`` keeps the dense DSA indexer for that chunk;
+    # ``final_candidates`` (0 = same as prefill budget) gives it a larger budget.
+    sparse_prefill_dense_final: bool = False
+    sparse_prefill_final_candidates: int = 0
     profile: bool = False
+
+    @property
+    def prefill_candidate_tokens(self) -> int:
+        return self.sparse_prefill_candidates or self.candidate_tokens
+
+    @property
+    def final_candidate_tokens(self) -> int:
+        return self.sparse_prefill_final_candidates or self.prefill_candidate_tokens
 
     # ------------------------------------------------------------------ #
     @property
@@ -290,6 +308,10 @@ class PartitionConfig:
             raise PartitionConfigError("SPARSE_PREFILL requires GPU partitions and FP8 summaries")
         if self.sparse_prefill_rows < 1:
             raise PartitionConfigError("SPARSE_PREFILL_ROWS must be positive")
+        for name in ("sparse_prefill_candidates", "sparse_prefill_final_candidates"):
+            v = getattr(self, name)
+            if v < 0 or v % 256:
+                raise PartitionConfigError(f"{name.upper()} must be 0 or a positive multiple of 256")
         if self.enabled:
             _refuse_conflicting_experiments()
         return self
@@ -311,6 +333,8 @@ class PartitionConfig:
             f"fallback_layers={self.fallback_layers} candidate_tokens={self.candidate_tokens} "
             f"sink={self.sink_tokens} tail={self.tail_tokens} decode_chunk={self.decode_chunk} "
             f"sparse_prefill={self.sparse_prefill}@{self.sparse_prefill_rows}rows"
+            f"/{self.prefill_candidate_tokens}cand"
+            f"/final={'dense' if self.sparse_prefill_dense_final else self.final_candidate_tokens}"
         )
 
 
@@ -428,6 +452,15 @@ def config_from_env() -> PartitionConfig:
     raw = _env("SPARSE_PREFILL_ROWS")
     if raw:
         updates["sparse_prefill_rows"] = int(raw)
+    raw = _env("SPARSE_PREFILL_CANDIDATES")
+    if raw:
+        updates["sparse_prefill_candidates"] = int(raw)
+    raw = _env("SPARSE_PREFILL_FINAL_CANDIDATES")
+    if raw:
+        updates["sparse_prefill_final_candidates"] = int(raw)
+    raw = _env("SPARSE_PREFILL_DENSE_FINAL")
+    if raw is not None:
+        updates["sparse_prefill_dense_final"] = _parse_bool("SPARSE_PREFILL_DENSE_FINAL", raw)
     raw = _env("GPU_STREAM")
     if raw is not None:
         updates["gpu_stream"] = raw.lower()

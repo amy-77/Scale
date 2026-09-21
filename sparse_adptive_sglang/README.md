@@ -1,50 +1,91 @@
-# Adaptive-HISA — P-key, L/8 split -> L/64 target merge (code snapshot 2026-09-20)
+# Adaptive-HISA sparse prefill — `adaptive_0921_h202` (snapshot 2026-09-21)
 
-Source machine: h20-9-57, tree `/DATA/disk0/qyl/code/dpskv32/sglang-hisa`
-Repo: https://github.com/xuyufei-a/sglang_hisa, branch hisa_pr
-Git HEAD: see `git_head.txt` (faa198b4e); working tree = HEAD + `changes_vs_HEAD.patch` + the untracked files under `delta/`.
+Source machine h20-9-57, tree `/DATA/disk0/qyl/code/adaptive_0921_h202`.
+Base: https://github.com/xuyufei-a/sglang_hisa branch `hisa_pr`, git HEAD `faa198b4e` (`git_head.txt`);
+working tree = HEAD + `changes_vs_HEAD.patch` + the untracked files listed in `delta/`.
+
+`h202` forks `adaptive_0921_h201` (P-key partition, L/8 λ-DP split → L/64 target merge, two-level selection
+in **decode** only) and moves the same two-level selection into **prefill**. Kernel-side changes inherited
+from h201 are listed in `VERSION.md` / `SPEEDOPT_NOTES.md`.
 
 ## Layout
 
-- `python/`                 complete drop-in `python/` tree (point `PYTHONPATH` at it, exactly what the e2e runner freezes and mounts)
-- `delta/`                  only the files that differ from git HEAD, for review:
-  - `python/.../nsa/adaptive_hisa/`   the whole partition/decode package (untracked in git)
-  - `python/.../nsa/nsa_indexer.py`, `managers/schedule_batch.py`, `mem_cache/memory_pool.py`,
-    `model_executor/{cuda_graph_runner,forward_batch_info}.py`, `models/deepseek_v2.py`   modified hooks
-  - `python/.../nsa/indexer_dump.py`, `scripts/{run_indexer_dump.sh,collect_indexer_dump.py}`   offline dump tooling
-  - `test/registered/unit/test_adaptive_hisa_{prefill_partition,decode}.py`   unit tests (74/74 pass for prefill_partition)
-  - `docs_research/`        design notes (zh)
-- `changes_vs_HEAD.patch`   `git diff HEAD -- python/` for the tracked files
-- `runner/run_pkey_target64.py`   e2e queue (LongBench v2 + RULER 32k/128k) for this configuration; `run_pkey_align.py` is the previous P-key run it derives from
-- `stats/`                  chunk-length distributions and target-merge convergence on 17 indexer dumps x 11 layers
+- `python/`   complete drop-in `python/` tree (`PYTHONPATH=<this>/python`; exactly what the e2e runner freezes and mounts)
+- `delta/`    only the files that differ from git HEAD, for review
+  - `python/.../nsa/adaptive_hisa/`   partition / summary / decode / **prefill_select.py** package
+  - `python/.../nsa/nsa_indexer.py`   the sparse-prefill hook in `_get_topk_ragged`
+  - `test/registered/unit/test_adaptive_hisa_sparse_prefill.py`   6 tests (config, expand kernel vs Python, admission, Top-K vs dense-restricted)
+  - `docs_research/adaptive_hisa_sparse_prefill.md`   design + all measurements (zh)
+  - `docs_research/speed_bench_128k_20260921.md`       128K TTFT/TPOT: DSA vs HISA-64 vs adaptive (zh)
+- `runner/run_sparse_prefill_e2e.py`   e2e queue (LongBench v2 held-out 401 + RULER 32k/128k 364); `--arm`, `--quick-niah`
+- `changes_vs_HEAD.patch`, `speedopt_vs_snapshot1219.patch`   diffs (see `SPEEDOPT_NOTES.md`)
 
-## What is new vs. the 2026-09-19 snapshot / the finished P-key e2e run
+## What sparse prefill does
 
-1. `partition_metric=key_sse` (P-key): partition energy is the key SSE `sum_i ||k_i - mu_b||^2`, query independent.
-2. Target-count merge (`config.merge_target_divisor`, env `SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_DIVISOR=64`):
-   the lambda-DP split still produces L/8 leaves; the merge then converges to exactly `floor(L/64)` chunks
-   (same chunk count as HISA at chunk size 64). Per round, on device and CUDA-graph capturable:
-   Ward cost of every adjacent pair -> admit the `2*(count-target)` cheapest -> non-overlapping matching ->
-   merge the `count-target` cheapest matched pairs. Never overshoots; 187/187 layer builds hit the target
-   exactly in <= 5 rounds (`merge_target_rounds=8` is the cap). Method label: `P-key-sync_nonoverlap-target64`.
-3. CUDA-graph capture is OOM-robust (evict-before-capture, one retry after `empty_cache`, cooldown instead of
-   permanent disable) and the fp64 tree build is row-chunked.
-4. Merge cost kernel tile 64 -> 32 rows (fp64, C=128), ~40% faster.
+sglang chunked prefill runs the prompt in 8192-query chunks. With
+`SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL=1`:
+
+1. every chunk builds the P-key partition + FP8 mean summaries of its sealed prefix on the side stream
+   (`prefill_runtime.prepare_prefill_partition` no longer requires the final chunk);
+2. the next chunk's indexer (`prefill_select.sparse_topk_core`) replaces the dense `[8192, N]` DSA logits with
+   coarse summary logits → per-row leaf ranking → expand the best leaves to `budget` raw tokens
+   (Triton `_expand_slots_kernel`, crossing leaf clipped) → exact fp8 logits on those tokens + the causal local
+   window → fused Top-2048. Leaves that start inside `[0, sink_tokens)` are forced to the top (attention sink).
+   All device-side, no `.item()`.
+3. chunks 0/1 stay dense (prefix < budget); decode is unchanged from h201.
+
+Knobs (env prefix `SGLANG_NSA_ADAPTIVE_HISA_`):
+
+| env | default | meaning |
+|---|---|---|
+| `SPARSE_PREFILL` | 0 | enable (0 = h201 behaviour) |
+| `SPARSE_PREFILL_ROWS` | 2048 | query rows per fine sub-batch |
+| `SPARSE_PREFILL_CANDIDATES` | 0 | leaf-token budget for prefill (0 = decode `CANDIDATE_TOKENS`, 8192) |
+| `SPARSE_PREFILL_FINAL_CANDIDATES` | 0 | budget for the final prompt chunk only |
+| `SPARSE_PREFILL_DENSE_FINAL` | 0 | keep the dense DSA indexer for the final prompt chunk |
+
+## Results (128K, 8×H20 TP8, DeepSeek-V3.2)
+
+Speed (`speed_bench_128k_20260921.md`, 128K in / 128 out, CUDA graph for decode):
+
+| | TTFT | TPOT |
+|---|---:|---:|
+| DSA | 68.4 s | 20.3 ms |
+| HISA-64 (fixed blocks, two-level prefill+decode) | 38.4 s | 17.8 ms |
+| h201 adaptive, decode-only | 68.9 s | 19.2 ms |
+| h202 sparse prefill (single request, no graph) | 56.3 s | – |
+
+Accuracy of the all-chunks-sparse arm (`sparse_prefill`, budget 8192, sink 64) vs h201 on the same held-out rows:
+
+| | LongBench v2 (401) | RULER 32k (182) | RULER 128k (182) |
+|---|---:|---:|---:|
+| DSA | 0.504 | 0.872 | 0.821 |
+| h201 decode-only | 0.501 | 0.882 | 0.825 |
+| **h202 sparse prefill 8192** | **0.479** | 0.855 | **0.598** |
+
+The 128k loss is concentrated in NIAH (`niah_multikey_1/2/3` 0.43 / 0.36 / 0.21 vs 0.93 / 1.0 / 1.0). The first
+output token is produced by the **final** prompt chunk, whose last rows must locate the needle in the 128K prefix;
+mean summaries over a uniform haystack dilute the needle's leaf (prefix Top-2048 recall 0.55 on the NIAH dump,
+layer 3 only 0.18 — identical for fixed HISA-64 blocks).
+
+Fix under evaluation: `SPARSE_PREFILL_DENSE_FINAL=1` (intermediate chunks sparse, final chunk dense).
+128k `niah_multikey_1/2/3` on the 42 held-out rows: 0.71 / 0.93 / 0.93 (h201: 0.93 / 1.0 / 1.0); cost ≈ 1/8 of the
+dense indexer time (~1.5–2 s TTFT at 128K). Full LongBench + RULER with this arm is next.
+
+Details, per-task tables and the recall/mass sweeps: `delta/docs_research/adaptive_hisa_sparse_prefill.md`.
 
 ## Run
 
-Server env (same image/cmd as production, plus):
-
     PYTHONPATH=<this>/python
-    SGLANG_NSA_ADAPTIVE_HISA_PARTITION_METRIC=key_sse
-    SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_DIVISOR=64
+    SGLANG_NSA_ADAPTIVE_HISA_MODE=adaptive_decode
+    SGLANG_NSA_ADAPTIVE_HISA_PARTITION_METRIC=key_sse  SGLANG_NSA_ADAPTIVE_HISA_SPLIT_BACKEND=gpu
+    SGLANG_NSA_ADAPTIVE_HISA_MERGE_POLICY=sync_nonoverlap  SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_DIVISOR=64
+    SGLANG_NSA_ADAPTIVE_HISA_RAW_FP8_BUILDER=1  SGLANG_NSA_ADAPTIVE_HISA_GPU_STREAM=side
+    SGLANG_NSA_ADAPTIVE_HISA_SINK=64  SGLANG_NSA_ADAPTIVE_HISA_TAIL=256  SGLANG_NSA_ADAPTIVE_HISA_CANDIDATE_TOKENS=8192
+    SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL=1  [SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_DENSE_FINAL=1]
+    SGLANG_NSA_FUSE_TOPK=0
 
-The warm-up log line must read `metric=key_sse method=P-key-sync_nonoverlap-target64`.
-Without `MERGE_TARGET_DIVISOR` the old threshold merge (2 rounds, lambda*alpha, ~L/9.2 chunks) is used.
+Server: `--chunked-prefill-size 8192 --max-running-requests 1 --disable-radix-cache`. The log must contain
+`adaptive-hisa sparse prefill layer=... final=...` lines once the third chunk is reached.
 
-Unit tests (GPU):
-
-    cd <tree>; PYTHONPATH=python python -m pytest test/registered/unit/test_adaptive_hisa_prefill_partition.py -q
-
-Chunk-length statistics from `stats/` (17 dumps x 11 layers): after split mean 8.0 (p50 8, max 128);
-after target merge mean 64.0 for every length (p10 ~40, p50 64, p90 ~90, p99 ~125, max 416).
+Unit tests (GPU): `PYTHONPATH=python python -m pytest delta/test/registered/unit/test_adaptive_hisa_sparse_prefill.py -q`
