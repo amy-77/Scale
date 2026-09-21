@@ -209,6 +209,53 @@ class TestAdmission(unittest.TestCase):
 class TestSparsePrefillGPU(unittest.TestCase):
     """Fine stage + Top-K must reproduce the dense Top-2048 restricted to the candidate set."""
 
+    def test_split_topk_equals_fused_topk_on_concatenation(self):
+        """Top-K over (leaf logits | window logits) read in place selects the
+        same tokens as the fused Top-K over their torch.cat, including rows
+        whose valid prefix ends inside the window, a strided window slice and
+        rows with fewer than 2048 valid columns."""
+        from sglang.srt.layers.attention.nsa.hisa.hisa_topk_fused import (
+            hisa_topk_candidates_fused,
+            hisa_topk_candidates_split,
+        )
+
+        torch.manual_seed(5)
+        dev = torch.device('cuda')
+        R, budget, width, n_complete = 6, 8192, 8448, 65536
+        # Gaussian logits: the values are distinct (no tie at the threshold) and
+        # spread over several FP32 high-byte buckets, which HISA's radix kernel
+        # needs (a single huge threshold bucket overflows its shared buffer and
+        # the fused kernel itself becomes inexact — a pre-existing limit).
+        score_a = torch.randn(R, budget, device=dev)
+        score_b_full = torch.randn(R, width + 64, device=dev)
+        score_b = score_b_full[:, :width]  # strided (row stride width + 64)
+        cand_a = torch.randperm(n_complete, device=dev)[: R * budget].view(R, budget).to(torch.int32)
+        ke = torch.tensor([width, 4000, 1, 0, 7000, width - 1], dtype=torch.int32, device=dev)
+        ctx = n_complete + ke
+        lengths = (budget + ke).contiguous()
+        # row 3: fewer than 2048 valid columns overall -> identity path with -1 padding
+        lengths[3] = 1500
+        split = hisa_topk_candidates_split(score_a, score_b, lengths, cand_a, n_complete, ctx)
+        local_ids = torch.arange(n_complete, n_complete + width, dtype=torch.int32, device=dev)
+        fused = hisa_topk_candidates_fused(
+            torch.cat((score_a, score_b), 1).contiguous(),
+            torch.cat((cand_a, local_ids.expand(R, -1)), 1).contiguous(),
+            lengths, ctx, None,
+        )
+        # order is not specified (radix + atomics); compare sorted rows
+        self.assertTrue(torch.equal(split.sort(1).values, fused.sort(1).values))
+        self.assertEqual(int((split[3] == -1).sum()), 2048 - 1500)
+        # and both equal the exact Top-K over the valid prefix of the concatenation
+        score_cat = torch.cat((score_a, score_b), 1)
+        cand_cat = torch.cat((cand_a, local_ids.expand(R, -1)), 1)
+        for r in range(R):
+            L = int(lengths[r])
+            ref = cand_cat[r, torch.topk(score_cat[r, :L], min(2048, L)).indices]
+            got = split[r]
+            got = got[got >= 0]
+            self.assertTrue(torch.equal(got.sort().values, ref.sort().values), msg=f"row {r}")
+            self.assertTrue(bool((got[got >= n_complete] < ctx[r]).all()))
+
     def test_topk_equals_dense_restricted_to_candidates(self):
         import deep_gemm
 

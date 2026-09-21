@@ -105,9 +105,22 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-__device__ void fast_topk_cuda_tl(const float *__restrict__ input,
-                                  int *__restrict__ index, int row_start,
-                                  int length) {
+// Row made of two column segments: [0, split) read from ``a`` and
+// [split, length) from ``b``. Lets the radix selector consume the leaf-candidate
+// logits and the local-window logits of Adaptive-HISA prefill without a
+// torch.cat of the two [B, ~8K] fp32 tensors (and the matching candidate ids).
+struct SplitRow {
+  const float *a;
+  const float *b;
+  int split;
+  __device__ __forceinline__ float operator[](int i) const {
+    return i < split ? a[i] : b[i - split];
+  }
+};
+
+template <typename Input>
+__device__ void fast_topk_cuda_tl(Input input, int *__restrict__ index,
+                                  int row_start, int length) {
   // An optimized topk kernel copied from tilelang kernel
   // We assume length > TopK here, or it will crash
   int topk = TopK;
@@ -797,6 +810,41 @@ void topk_candidates_kernel(
   }
 }
 
+// Adaptive-HISA prefill: Top-K over [leaf candidates | causal local window]
+// without materialising their concatenation. Column r < split is leaf
+// candidate r (score_a / cand_a); column r >= split is local token
+// local_base + (r - split) with score_b[r - split]. ``lengths`` (<= split +
+// score_b width) is the valid prefix per row, as before.
+__global__ __launch_bounds__(kThreadsPerBlock)
+void topk_candidates_split_kernel(
+    const float *__restrict__ score_a, int64_t stride_a,
+    const float *__restrict__ score_b, int64_t stride_b, int split,
+    const int32_t *__restrict__ lengths, const int32_t *__restrict__ cand_a,
+    int64_t cand_stride, int local_base, const int32_t *__restrict__ seq_lens,
+    int32_t *__restrict__ output) {
+  const int64_t bid = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int length = lengths[bid];
+  const SplitRow score{score_a + bid * stride_a, score_b + bid * stride_b, split};
+  __shared__ int selected[TopK];
+  if (length > TopK) {
+    fast_topk_cuda_tl(score, selected, 0, length);
+  } else {
+    for (int i = tid; i < TopK; i += kThreadsPerBlock)
+      selected[i] = i < length ? i : -1;
+    __syncthreads();
+  }
+  const int32_t *cand_row = cand_a + bid * cand_stride;
+  const int32_t seq = seq_lens[bid];
+  for (int i = tid; i < TopK; i += kThreadsPerBlock) {
+    const int r = selected[i];
+    int raw = -1;
+    if (r >= 0 && r < length)
+      raw = r < split ? cand_row[r] : local_base + (r - split);
+    output[bid * TopK + i] = raw >= 0 && raw < seq ? raw : -1;
+  }
+}
+
 } // namespace
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -1031,7 +1079,45 @@ void topk_candidates_interface(
   TORCH_CHECK(cudaGetLastError() == cudaSuccess, "HISA candidate topk failed");
 }
 
+void topk_candidates_split_interface(
+    const at::Tensor &score_a, const at::Tensor &score_b,
+    const at::Tensor &lengths, const at::Tensor &cand_a, int64_t local_base,
+    const at::Tensor &seq_lens, at::Tensor &output) {
+  CHECK_CUDA(score_a);
+  CHECK_CUDA(score_b);
+  CHECK_CUDA(lengths);
+  CHECK_CUDA(cand_a);
+  CHECK_CUDA(seq_lens);
+  CHECK_CUDA(output);
+  const auto B = score_a.size(0);
+  TORCH_CHECK(score_a.dim() == 2 && score_a.stride(1) == 1 &&
+              score_a.scalar_type() == at::kFloat);
+  TORCH_CHECK(score_b.dim() == 2 && score_b.stride(1) == 1 &&
+              score_b.scalar_type() == at::kFloat && score_b.size(0) == B);
+  TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous() &&
+              lengths.size(0) == B && lengths.scalar_type() == at::kInt);
+  TORCH_CHECK(cand_a.dim() == 2 && cand_a.stride(1) == 1 &&
+              cand_a.size(0) == B && cand_a.size(1) == score_a.size(1) &&
+              cand_a.scalar_type() == at::kInt);
+  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous() &&
+              seq_lens.size(0) == B);
+  TORCH_CHECK(output.dim() == 2 && output.is_contiguous() &&
+              output.size(0) == B && output.size(1) == TopK);
+  setup_kernel_smem_once<topk_candidates_split_kernel, kSmem>();
+  topk_candidates_split_kernel<<<dim3(B), dim3(kThreadsPerBlock), kSmem,
+                                 at::cuda::getCurrentCUDAStream().stream()>>>(
+      score_a.data_ptr<float>(), score_a.stride(0), score_b.data_ptr<float>(),
+      score_b.stride(0), static_cast<int>(score_a.size(1)),
+      lengths.data_ptr<int32_t>(), cand_a.data_ptr<int32_t>(), cand_a.stride(0),
+      static_cast<int>(local_base), seq_lens.data_ptr<int32_t>(),
+      output.data_ptr<int32_t>());
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+              "HISA split candidate topk failed");
+}
+
 TORCH_LIBRARY(hisa_topk_fused, m) {
+  m.def("topk_candidates_split(Tensor score_a, Tensor score_b, Tensor lengths, "
+        "Tensor cand_a, int local_base, Tensor seq_lens, Tensor(a!) output) -> ()");
   m.def("topk_candidates(Tensor score, Tensor lengths, Tensor candidates, "
         "Tensor seq_lens, Tensor? page_table, Tensor(a!) output) -> ()");
   // Currently implemented (token-position output — replaces fast_topk_v2 +
@@ -1057,6 +1143,7 @@ TORCH_LIBRARY(hisa_topk_fused, m) {
 
 TORCH_LIBRARY_IMPL(hisa_topk_fused, CUDA, m) {
   m.impl("topk_candidates", topk_candidates_interface);
+  m.impl("topk_candidates_split", topk_candidates_split_interface);
   m.impl("topk_coord_transform_fused_paged",
          topk_coord_transform_fused_paged_interface);
   m.impl("topk_coord_transform_fused_ragged",

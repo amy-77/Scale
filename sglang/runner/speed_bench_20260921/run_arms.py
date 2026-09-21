@@ -77,6 +77,15 @@ ARMS = {
     "adaptive_sp_v4": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
                            env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
                                 "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048"}, override=None),
+    # 2026-09-22 01:xx: + Top-K reads leaf/local logits in place (no torch.cat), default. *_c4k runs the
+    # same code with --chunked-prefill-size 4096.
+    "adaptive_sp_v5": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
+                           env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
+                                "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048"}, override=None),
+    "adaptive_sp_v5_c4k": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
+                               env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
+                                    "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048"}, override=None,
+                               chunk=4096),
     "adaptive_sp_df": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
                            env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
                                 "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048",
@@ -129,7 +138,7 @@ def run_arm(arm, graph):
         argv += ["-e", f"{k}={v}"]
     cmd = ["python", "-m", "sglang.launch_server", "--model-path", MODEL, "--served-model-name", "deepseek-v3.2",
            "--tp-size", "8", "--host", "127.0.0.1", "--port", str(PORT), "--context-length", "163840",
-           "--trust-remote-code", "--reasoning-parser", "deepseek-v3", "--chunked-prefill-size", "8192",
+           "--trust-remote-code", "--reasoning-parser", "deepseek-v3", "--chunked-prefill-size", str(spec.get("chunk", 8192)),
            "--mem-fraction-static", "0.82", "--max-running-requests", "1", "--disable-radix-cache",
            "--random-seed", "20260921", "--watchdog-timeout", "900"]
     cmd += ["--cuda-graph-bs", "1"] if graph else ["--disable-cuda-graph"]

@@ -120,6 +120,20 @@ def topk():
     return outs
 t_topk = timeit(topk)
 print(f"cat + topk (16K candidates -> 2048): {t_topk:.3f} ms")
+from sglang.srt.layers.attention.nsa.hisa.hisa_topk_fused import hisa_topk_candidates_split
+def topk_split():
+    outs = []
+    for i, r0 in enumerate(range(0, n_q, step)):
+        R = step
+        count = (budget + ke_loc[r0:r0 + R]).contiguous()
+        outs.append(hisa_topk_candidates_split(fine[i], loc[i][:, :8192], count, cands[i], n_complete, pos1[r0:r0 + R]))
+    return outs
+t_split = timeit(topk_split)
+print(f"split topk, no cat (same 16K candidates -> 2048): {t_split:.3f} ms")
+# The radix Top-K breaks threshold ties with atomics (two runs of the same
+# path already differ in the odd tied token), so compare selected sets.
+agree = [(x.sort(1).values == y.sort(1).values).float().mean().item() for x, y in zip(topk(), topk_split())]
+print(f"split vs cat selected-set agreement: {min(agree):.6f}")
 # dense DSA reference for this chunk
 def dense():
     return deep_gemm.fp8_mqa_logits(q, (k, s), w, ks0, pos1, clean_logits=False)

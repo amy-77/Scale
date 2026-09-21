@@ -1,4 +1,4 @@
-# Adaptive-HISA 稀疏 Prefill — `adaptive_0921_h202`（代码快照 2026-09-22 00:40）
+# Adaptive-HISA 稀疏 Prefill — `adaptive_0921_h202`（代码快照 2026-09-22 01:20）
 
 来源机器 h20-9-57，目录 `/DATA/disk0/qyl/code/adaptive_0921_h202`。
 基线：https://github.com/xuyufei-a/sglang_hisa 分支 `hisa_pr`，git HEAD `faa198b4e`（`git_head.txt`）；
@@ -54,7 +54,7 @@
 | 排序 + 展开（旧，`PREFILL_SELECT=argsort`） | `prefill_select.py : rank_leaves`（`torch.argsort` + `cumsum`）→ `expand_candidates` → `_expand_slots_kernel`（Triton） | 每行叶子降序 + 叶长前缀和；每个 slot 二分找所在叶子写 token id |
 | 精排（叶子候选，**新**） | `prefill_select.py : _fine_scores` → `nsa/hisa/triton_kernels.py : block_sparse_mqa_triton(kv_block_size=1)`（`_block_sparse_mqa_persistent_kernel`） | 有 flat index-K 时用 HISA 持久化 kernel：一个 CTA 负责一行 2048 个候选 token id，Q 只读一次，gather 与 GEMM 流水；249 TFLOPS（H20 fp8 峰值 84%）。无 flat K 时退回 `sparse_paged_mqa_triton(K=1)` |
 | 精排（局部窗口） | `prefill_select.py : _local_keys` + `deep_gemm.fp8_mqa_logits`（`ke` 逐行因果） | 因果局部窗口 `[n_complete, pos]` 连续，用密集 kernel 打分后 `cat` |
-| Top-2048 | `nsa/hisa/hisa_topk_fused.py : hisa_topk_candidates_fused` | 输出 request-relative token id，格式同 `fast_topk_v2(..., row_starts=ks)` |
+| Top-2048（**09-22 新**） | `nsa/hisa/hisa_topk_fused.py : hisa_topk_candidates_split` → `csrc/hisa_topk_fused.cu : topk_candidates_split_kernel`（`SplitRow`） | radix Top-K 就地读 [叶子 logits \| 局部窗口 logits] 两段和对应候选 id，不再 `torch.cat`；2.09 → 1.27 ms/层/chunk；输出 request-relative token id |
 | 核心编排 | `prefill_select.py : sparse_topk_core`（可独立测试）、`sparse_prefill_topk`（服务内包装） | 行按 `SPARSE_PREFILL_ROWS` 分批，全程无 `.item()` |
 
 ### C. Decode 侧（h201 继承；09-22 选择算子 fast path 提速 2.7×，结果逐位不变）
@@ -104,7 +104,7 @@ scheduler 组 batch
     │                         select_candidates_weighted(batched_weighted_select_kernel)   ← 选叶 + 展开
     │                         _fine_scores → block_sparse_mqa_triton(K=1, flat index-K)  ← 叶子候选精排
     │                         deep_gemm.fp8_mqa_logits(局部窗口)   ← [n_complete, pos] 精排
-    │                         hisa_topk_candidates_fused           ← Top-2048
+    │                         hisa_topk_candidates_split           ← Top-2048（两段就地读，无 cat）
     │                       }
     │                topk_result[:q_offset] = 上面的输出
     │           └─ nsa_indexer._schedule_adaptive_partition(forward_batch, layer_id, k_fp8, k_scale)
@@ -152,7 +152,9 @@ decode（与 h201 相同）
 | h202 + dense final | 50.80 s | 19.2 ms |
 | h202 + weighted radix select（09-21 22:xx） | 46.12 s | 19.3 ms |
 | h202 + flat 持久化精排 + 增量 SSE 树（09-21 23:xx） | 45.44 s | 19.2 ms |
-| **h202 + decode 选择算子 fast path 优化（09-22 00:xx，当前代码）** | **45.33 s** | **18.1 ms** |
+| h202 + decode 选择算子 fast path 优化（09-22 00:xx） | 45.33 s | 18.1 ms |
+| **h202 + Top-K 无 cat（09-22 01:xx，当前代码）** | **44.66 s** | **18.1 ms** |
+| 同上，`--chunked-prefill-size 4096` | 50.05 s | 18.2 ms |
 
 128K 最后一个 chunk、每层稀疏 indexer 各阶段（H20）：coarse GEMM 1.3 + 选叶 0.5 + 精排 4.4 + 局部窗口密集 GEMM 2.4 + cat/Top-2048 2.1 ≈ 10.7 ms
 （精排、局部窗口都已到 fp8 算力上限；HISA 自己的 K=64 块 kernel 处理同样 token 反而慢 6%），side stream 上每 chunk 建分区 4.7 ms（merge 8 轮 2.7 ms 占大头）。

@@ -380,12 +380,16 @@ def sparse_topk_core(
     slower), otherwise the paged K=1 kernel. The causal local window
     ``[n_complete, pos]`` is contiguous, so with ``dense_local`` it is scored
     with the dense DeepGEMM logits kernel on the window's keys (``ke`` per row
-    gives causality) and concatenated — about 2x cheaper than gathering the
-    window token by token.
+    gives causality) — about 2x cheaper than gathering the window token by
+    token. The Top-K (``hisa_topk_candidates_split``) reads the leaf and
+    window logits in place; nothing is concatenated.
     """
     import deep_gemm
 
-    from sglang.srt.layers.attention.nsa.hisa.hisa_topk_fused import hisa_topk_candidates_fused
+    from sglang.srt.layers.attention.nsa.hisa.hisa_topk_fused import (
+        hisa_topk_candidates_fused,
+        hisa_topk_candidates_split,
+    )
 
     n_q = q_fp8.shape[0]
     device = q_fp8.device
@@ -415,42 +419,37 @@ def sparse_topk_core(
     table = table.to(torch.int32)
     ctx = seq_lens_expanded.to(torch.int32)
     flat = _flat_keys(k_flat, int(seq_len))
+    # Row slices below (``ctx[rows]``, ``weights[rows]``, ``q_fp8[rows]``,
+    # ``ke_loc[rows]``) are contiguous by construction, so no ``.contiguous()``.
     if dense_local and local_len > 0:
         k_loc, s_loc = _local_keys(raw_pages, table, k_flat, n_complete, int(seq_len))
-        local_ids = torch.arange(n_complete, n_complete + local_len, dtype=torch.int32, device=device)
-        ke_loc = (ctx - n_complete).contiguous()
+        ke_loc = ctx - n_complete
         ks_loc = torch.zeros_like(ke_loc)
     out = torch.empty((n_q, cfg.index_topk), dtype=torch.int32, device=device)
     step = int(cfg.sparse_prefill_rows)
     for r0 in range(0, n_q, step):
         rows = slice(r0, min(r0 + step, n_q))
-        ctx_rows = ctx[rows].contiguous()
-        w_rows = weights[rows].contiguous()
+        ctx_rows = ctx[rows]
+        w_rows = weights[rows]
         if dense_local and local_len > 0:
             cand_leaf = select(rows, 0)
-            R = cand_leaf.shape[0]
             fine_leaf = _fine_scores(q_fp8[rows], w_rows, cand_leaf, ctx_rows, flat, raw_pages, table)
             local = deep_gemm.fp8_mqa_logits(
-                q_fp8[rows], (k_loc, s_loc), w_rows, ks_loc[rows].contiguous(), ke_loc[rows].contiguous(),
-                clean_logits=False,
-            )[:, :local_len]
-            if local.shape[1] < local_len:
-                # DeepGEMM sizes the output by this sub-batch's max ke; the
-                # missing columns are beyond every row's causal end and are
-                # excluded by ``count`` below, so pad them with -inf.
-                pad = torch.full((R, local_len - local.shape[1]), float("-inf"),
-                                 dtype=local.dtype, device=device)
-                local = torch.cat((local, pad), dim=1)
-            score = torch.cat((fine_leaf, local), dim=1)
-            cand = torch.cat((cand_leaf, local_ids.unsqueeze(0).expand(R, -1)), dim=1)
-            # valid prefix per row: budget leaf tokens + the causal part of the window
-            count = (budget + ke_loc[rows]).contiguous()
+                q_fp8[rows], (k_loc, s_loc), w_rows, ks_loc[rows], ke_loc[rows], clean_logits=False,
+            )
+            # Top-K reads the two logits segments in place (leaf candidates,
+            # then the causal window) instead of a [R, ~16K] fp32 + int32
+            # torch.cat (~0.8 ms per layer per chunk at 128K). Valid prefix per
+            # row = budget leaf tokens + the causal part of the window; DeepGEMM
+            # sizes ``local`` by this sub-batch's max ke, so it covers every row.
+            out[rows] = hisa_topk_candidates_split(
+                fine_leaf, local, budget + ke_loc[rows], cand_leaf, n_complete, ctx_rows
+            )
         else:
             cand = select(rows, local_len)
-            R = cand.shape[0]
             score = _fine_scores(q_fp8[rows], w_rows, cand, ctx_rows, flat, raw_pages, table)
-            count = torch.full((R,), cand.shape[1], dtype=torch.int32, device=device)
-        out[rows] = hisa_topk_candidates_fused(score, cand, count, ctx_rows, None)
+            count = torch.full((cand.shape[0],), cand.shape[1], dtype=torch.int32, device=device)
+            out[rows] = hisa_topk_candidates_fused(score, cand, count, ctx_rows, None)
     return out
 
 
@@ -487,7 +486,7 @@ def _fine_scores(q_rows, w_rows, cand, ctx_rows, flat, raw_pages, table) -> torc
     if flat is not None:
         k, s = flat
         ks = torch.zeros_like(ctx_rows)
-        return block_sparse_mqa_triton(q_rows.contiguous(), k, s, cand, 1, w_rows, ks, ctx_rows)
+        return block_sparse_mqa_triton(q_rows, k, s, cand, 1, w_rows, ks, ctx_rows)
     return sparse_paged_mqa_triton(
         q_rows.unsqueeze(1), raw_pages, cand.unsqueeze(1), 1,
         w_rows.unsqueeze(1), ctx_rows, table.expand(R, -1),

@@ -79,3 +79,16 @@ production-shape cases, CUDA-graph replay).
 - End-to-end (128K / 128 out, graph, 1 warmup + 3 reps, `adaptive_sp_v4_graph`): TPOT 19.16 -> **18.10 ms**
   (18.09 / 18.10 / 18.12; -1.06 ms, matches 61 layers x ~20 µs), TTFT 45.44 -> 45.33 s (noise; prefill
   untouched). DSA 20.3 ms, HISA-64 17.85 ms.
+
+## 2026-09-22 (01:00) — prefill Top-K without torch.cat (128K TTFT 45.33 -> 44.66 s); chunk 4096 measured
+
+- `hisa/csrc/hisa_topk_fused.cu`: `SplitRow` + templated `fast_topk_cuda_tl`; new op `topk_candidates_split`
+  (`hisa_topk_candidates_split`) selects Top-2048 over [leaf logits | local-window logits] read in place.
+  `prefill_select.sparse_topk_core` no longer concatenates logits/candidate ids or pads the window:
+  2.09 -> 1.27 ms per layer per chunk (`fine_scorer_stage_bench.py`). Redundant `.contiguous()` on row
+  slices removed (no-ops). Test: `test_split_topk_equals_fused_topk_on_concatenation` (== fused-on-cat and
+  == exact torch.topk, sets; HISA's radix kernel resolves threshold ties with atomics so order is unspecified).
+- e2e: TTFT 45.33 -> 44.66 s (3 reps 44.83 / 44.65 / 44.66), TPOT 18.07 ms.
+- `--chunked-prefill-size 4096` with the same code: TTFT 50.05 s (+5.4 s). Per-chunk prefill time is ~flat in
+  the prefix length (2.85 s per 8192 chunk, 1.5 s per 4096 chunk), so halving the chunk doubles the per-chunk
+  fixed cost (61 x 4.7 ms partition build per chunk ~= 0.29 s of the +0.34 s per extra chunk). Not adopted.

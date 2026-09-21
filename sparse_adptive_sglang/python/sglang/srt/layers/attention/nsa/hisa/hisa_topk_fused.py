@@ -67,6 +67,22 @@ def hisa_topk_candidates_fused(score, candidates, lengths, seq_lens, page_table=
     return out
 
 
+def hisa_topk_candidates_split(score_a, score_b, lengths, cand_a, local_base, seq_lens, out=None):
+    """``hisa_topk_candidates_fused(cat(score_a, score_b), cat(cand_a, local_ids))``
+    without the concatenation: column ``r < score_a.shape[1]`` is candidate
+    ``cand_a[:, r]``; column ``r >= score_a.shape[1]`` is token
+    ``local_base + (r - score_a.shape[1])`` scored by ``score_b``. ``lengths``
+    is the valid prefix per row (``<= score_a.shape[1] + score_b.shape[1]``).
+    ``score_b`` may be a column slice (row stride is honoured).
+    """
+    if out is None:
+        out = torch.empty((score_a.shape[0], TOPK), dtype=torch.int32, device=score_a.device)
+    torch.ops.hisa_topk_fused.topk_candidates_split(
+        score_a, score_b, lengths, cand_a, int(local_base), seq_lens.reshape(-1), out
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # topk + coord-transform (output = HISA's token-position contract)
 # ---------------------------------------------------------------------------
