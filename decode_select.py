@@ -25,11 +25,31 @@ _PROFILE_STATS: dict[str, torch.Tensor] = {}
 _PROFILE_SIZE = 106
 
 
+def warp_opt_mask() -> int:
+    """Compile-time bitmask for the fast-path warp-level variants
+    (1 = warp-aggregated Phase A histogram, 2 = ballot compaction of the
+    threshold bucket, 4 = warp-aggregated Phase C histograms). Selection is
+    identical for every value; only the number of shared atomics changes.
+    Default 0: on H20 the per-leaf shared atomics beat ``__match_any_sync``
+    (see runner/bench_weighted_select.py). ``ADAPTIVE_HISA_SELECT_WARP_OPT=7``
+    enables all three."""
+    raw = os.environ.get("ADAPTIVE_HISA_SELECT_WARP_OPT", "0").strip().lower()
+    if raw in ("", "0", "false", "off", "no"):
+        return 0
+    if raw in ("1", "true", "on", "yes", "all"):
+        return 7
+    return int(raw) & 7
+
+
 def _load_module():
     load(
         name="adaptive_hisa_weighted_select",
         sources=[str(_HERE / "csrc" / "weighted_select.cu")],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_cuda_cflags=[
+            "-O3",
+            "--use_fast_math",
+            f"-DADAPTIVE_HISA_WS_WARP_OPT={warp_opt_mask()}",
+        ],
         is_python_module=False,
         verbose=bool(
             int(os.environ.get("ADAPTIVE_HISA_SELECT_VERBOSE", "0"))

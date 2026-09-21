@@ -50,3 +50,32 @@ All three changes are output-identical to the previous version (unit-tested `tor
 - Tests: `test_adaptive_hisa_sparse_prefill.py` (+`TestWeightedSelect`, flat-vs-paged fine parity),
   `test_adaptive_hisa_prefill_partition.py` (+`test_incremental_tree_is_bitwise_identical`,
   `test_tree_cache_epoch_and_final`); 61 passed.
+
+## 2026-09-22 — decode selector (`csrc/weighted_select.cu`) fast path: 38.8 -> 14.2 µs at n=2048
+
+Reference: `Adaptive_HISA_WeightedSelect_Warp优化_Cursor修改指南.pdf` (warp-aggregated histogram atomics +
+ballot compaction of the threshold bucket). Selection contract, host API, fallback kernel and final
+logical scan unchanged; everything below is bit-exact against the six-pass legacy kernel
+(`test_weighted_selector_fast_path_bit_exact_sweep`: n = 0/1/31/32/33/1023/1024/1025/4096, ties, ±0,
+denormal/huge, zero/guard-clipped/crossing leaves, budget < guards and > everything, 60 random
+production-shape cases, CUDA-graph replay).
+
+- Implemented the guide's two warp optimisations behind the compile-time bitmask
+  `ADAPTIVE_HISA_WS_WARP_OPT` (env `ADAPTIVE_HISA_SELECT_WARP_OPT`: 1 = Phase A `__match_any_sync` +
+  `__reduce_add_sync` histogram, 2 = Phase B ballot compaction, 4 = Phase C histograms; sm70 shuffle
+  fallback). Measured on H20 they are **not** a win: Phase A +2.6 µs, Phase C +1.7 µs, Phase B ±0
+  (n=1024; worse at 4096). Shared atomics on ~10-25 hot bins are cheaper than `__match_any_sync` for a
+  single 1024-thread CTA; the guide's own risk list anticipated this. Default is 0 (per-leaf atomics).
+- Profiling showed the actual hot spot was the *single-thread* 256-bin descending scan that picks the
+  threshold byte, executed 4 times (Phase A + three Phase C passes): ~3.5 µs each of dependent shared
+  loads. Replaced by `warp_threshold_bin` (one warp, 8 bins/lane, shuffle prefix + ballot); same
+  result, prefix kernel 22.4 -> 8.9 µs (n=1024), 25.4 -> 14.4 µs (n=4096).
+- `expand_selected_kernel`: each warp inspected leaves one at a time (n/32 dependent global round
+  trips per warp). Now 32 leaves per warp per round with coalesced loads and ballot-driven interval
+  writes: 15.3 -> 8.5 µs (n=2048), 27.6 -> 8.6 µs (n=4096), independent of n.
+- `runner/bench_weighted_select.py`: `--scores {quantized,relu}` (positive, concentrated scores like the
+  real coarse output). Full selector (prefix + expand), adaptive_real lengths, median µs:
+  n=1024 31.3 -> 11.5, n=2048 38.8 -> 14.2, n=4096 52.9 -> 19.3 (HISA `fast_topk` on the same n: 10.1).
+- End-to-end (128K / 128 out, graph, 1 warmup + 3 reps, `adaptive_sp_v4_graph`): TPOT 19.16 -> **18.10 ms**
+  (18.09 / 18.10 / 18.12; -1.06 ms, matches 61 layers x ~20 µs), TTFT 45.44 -> 45.33 s (noise; prefill
+  untouched). DSA 20.3 ms, HISA-64 17.85 ms.

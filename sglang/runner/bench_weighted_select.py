@@ -83,6 +83,7 @@ def run_case(
     iterations: int,
     rounds: int,
     real_lengths: list[int] | None,
+    score_dist: str = "quantized",
 ) -> dict:
     from sglang.srt.layers.attention.nsa.adaptive_hisa.decode_select import (
         expand_selected_candidates,
@@ -101,9 +102,16 @@ def run_case(
     starts_t = starts.to(device="cuda")
     # Quantisation creates realistic ties and exercises stable leaf-index
     # semantics while retaining multiple FP32 high-byte buckets.
-    scores = (
-        torch.randint(-4096, 4097, (n,), generator=generator).float() / 128.0
-    ).to(device="cuda")
+    if score_dist == "relu":
+        # Positive, roughly log-normal like the ReLU-summed coarse scores:
+        # most leaves land in a handful of FP32 high-byte buckets.
+        scores = (
+            torch.randn((n,), generator=generator).abs() * 100.0
+        ).to(device="cuda")
+    else:
+        scores = (
+            torch.randint(-4096, 4097, (n,), generator=generator).float() / 128.0
+        ).to(device="cuda")
     num_leaves = torch.tensor([n], dtype=torch.int32, device="cuda")
     seq_len = torch.tensor([sum(lengths)], dtype=torch.int32, device="cuda")
     prefix_fast = torch.empty(n, dtype=torch.int32, device="cuda")
@@ -182,6 +190,7 @@ def run_case(
     result = {
         "n": n,
         "distribution": distribution,
+        "score_dist": score_dist,
         "selected_tokens": count,
         "new_weighted": measure(fast, warmup, iterations, rounds),
         "old_weighted": measure(legacy, warmup, iterations, rounds),
@@ -229,6 +238,12 @@ def main() -> None:
         type=Path,
         help="optional JSON list of measured adaptive leaf lengths",
     )
+    parser.add_argument(
+        "--scores",
+        default="quantized",
+        choices=["quantized", "relu"],
+        help="synthetic coarse-score distribution",
+    )
     parser.add_argument("--budget", type=int, default=8192)
     parser.add_argument("--sink", type=int, default=64)
     parser.add_argument("--tail", type=int, default=256)
@@ -259,6 +274,7 @@ def main() -> None:
                 iterations=args.iterations,
                 rounds=args.rounds,
                 real_lengths=real_lengths,
+                score_dist=args.scores,
             )
             report.append(row)
             print(json.dumps(row), flush=True)

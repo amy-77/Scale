@@ -255,6 +255,119 @@ class TestDecodeGPU(unittest.TestCase):
         self.assertGreater(profile["fast_calls"], 0)
         self.assertIsNotNone(profile["p50_bucket_ratio_pct"])
 
+    def test_weighted_selector_fast_path_bit_exact_sweep(self):
+        """Fast path (warp threshold-bin search, optional warp-aggregated
+        atomics, lane-parallel expansion) vs the exact six-pass legacy
+        kernel: selected_prefix, count and candidates must match element-wise
+        for every size class, tie pattern, guard and budget, and the expansion
+        must reproduce the prefix contract; graph replay must be stable."""
+        import random
+
+        from sglang.srt.layers.attention.nsa.adaptive_hisa.decode_select import (
+            weighted_select_candidates,
+            weighted_select_candidates_legacy,
+        )
+
+        rng = random.Random(20260922)
+
+        def run(n, lengths, scores, unsealed, budget, sink, tail):
+            capacity = max(64, math.ceil(n / 64) * 64)
+            starts = [0]
+            for length in lengths[:-1]:
+                starts.append(starts[-1] + length)
+            complete = sum(lengths) if n else 0
+            seq = complete + unsealed
+            gpu = lambda values, dtype: torch.tensor(values, dtype=dtype, device='cuda')
+            sc = gpu(scores + [float('-inf')] * (capacity - n), torch.float32)
+            ln = gpu(lengths + [0] * (capacity - n), torch.int32)
+            st = gpu((starts if n else []) + [complete] * (capacity - n), torch.int32)
+            nl = gpu([[n]], torch.int32)
+            sq = gpu([seq], torch.int32)
+            outs = []
+            for fn in (weighted_select_candidates, weighted_select_candidates_legacy):
+                prefix = torch.full((capacity,), -7, dtype=torch.int32, device='cuda')
+                cand, cnt = fn(sc, ln, st, nl, sq, prefix, budget, sink, tail)
+                outs.append((prefix[:n].tolist(), cand[0].tolist(), int(cnt.item())))
+            (p_fast, c_fast, k_fast), (p_legacy, c_legacy, k_legacy) = outs
+            self.assertEqual(k_fast, k_legacy)
+            self.assertEqual(p_fast, p_legacy)
+            self.assertEqual(c_fast, c_legacy)
+            # Expansion contract from the prefix: sink, selected intervals in
+            # logical order, tail, then -1 padding.
+            sink_end = min(max(sink, 0), max(seq, 0))
+            tail_start = max(sink_end, seq - tail)
+            expected = list(range(min(sink_end, budget)))
+            previous = 0
+            for i in range(n):
+                take = p_fast[i] - previous
+                if take > 0:
+                    first = min(max(starts[i], sink_end), tail_start)
+                    expected.extend(range(first, first + take))
+                previous = p_fast[i]
+            expected = expected[:budget]
+            expected.extend(range(tail_start, seq))
+            expected = expected[:budget]
+            self.assertEqual(k_fast, len(expected))
+            self.assertEqual(c_fast[:k_fast], expected)
+            self.assertTrue(all(v == -1 for v in c_fast[k_fast:]))
+
+        def scores_for(n, kind):
+            if kind == 'ties':
+                return [rng.choice([1.0, 2.0, 3.0]) for _ in range(n)]
+            if kind == 'zeros':
+                return [rng.choice([0.0, -0.0, 1e-30, -1e-30]) for _ in range(n)]
+            if kind == 'wide':
+                return [rng.uniform(-1, 1) * 10 ** rng.uniform(-30, 30) for _ in range(n)]
+            if kind == 'same':
+                return [5.0] * n
+            return [abs(rng.gauss(0, 1)) * 100 for _ in range(n)]
+
+        for n in (0, 1, 31, 32, 33, 1023, 1024, 1025, 4096):
+            for kind in ('relu', 'ties', 'zeros', 'wide', 'same'):
+                for rep in range(3):
+                    if rep == 0:
+                        lengths = [rng.randint(1, 128) for _ in range(n)]
+                    elif rep == 1:
+                        lengths = [rng.choice([0, 1, 8, 64, 512]) for _ in range(n)]
+                    else:
+                        lengths = [64] * n
+                    sink, tail = rng.choice([(0, 0), (64, 256), (4, 9), (100000, 5)])
+                    budget = max(rng.choice([128, 2048, 8192, 200000]), sink + tail)
+                    run(n, lengths, scores_for(n, kind), rng.randint(0, 300), budget, sink, tail)
+        for _ in range(60):
+            n = rng.randint(1, 4096)
+            run(n, [rng.randint(1, 160) for _ in range(n)], scores_for(n, 'relu'),
+                rng.randint(0, 255), 8192, 64, 256)
+
+        # CUDA graph replay: no host sync or allocation; bit-stable output.
+        n = 2048
+        lengths = [rng.randint(8, 128) for _ in range(n)]
+        starts = torch.tensor([0] + lengths[:-1], dtype=torch.int64).cumsum(0).to(torch.int32).cuda()
+        ln = torch.tensor(lengths, dtype=torch.int32, device='cuda')
+        sc = torch.tensor(scores_for(n, 'relu'), dtype=torch.float32, device='cuda')
+        nl = torch.tensor([[n]], dtype=torch.int32, device='cuda')
+        sq = torch.tensor([sum(lengths) + 17], dtype=torch.int32, device='cuda')
+        prefix = torch.empty(n, dtype=torch.int32, device='cuda')
+        cand = torch.empty((1, 8192), dtype=torch.int32, device='cuda')
+        cnt = torch.empty(1, dtype=torch.int32, device='cuda')
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            weighted_select_candidates(sc, ln, starts, nl, sq, prefix, 8192, 64, 256,
+                                       candidates_out=cand, count_out=cnt)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            weighted_select_candidates(sc, ln, starts, nl, sq, prefix, 8192, 64, 256,
+                                       candidates_out=cand, count_out=cnt)
+        graph.replay()
+        torch.cuda.synchronize()
+        reference = (prefix.clone(), cand.clone(), cnt.clone())
+        for _ in range(10):
+            graph.replay()
+        torch.cuda.synchronize()
+        for actual, expected in zip((prefix, cand, cnt), reference):
+            self.assertTrue(torch.equal(actual, expected))
+
     def test_raw_gather_noncontiguous_physical_pages(self):
         from sglang.srt.layers.attention.nsa.adaptive_hisa.decode_kernels import gather_candidate_keys
         n=16384

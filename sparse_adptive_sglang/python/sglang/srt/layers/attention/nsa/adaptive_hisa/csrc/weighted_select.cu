@@ -59,6 +59,123 @@ __device__ __forceinline__ uint64_t stable_leaf_key(float score, int index) {
          static_cast<uint64_t>(0xffffu - static_cast<uint32_t>(index));
 }
 
+// Warp-level helpers for the fast path (Phase A / B / C). They are selected
+// at compile time by the bitmask ADAPTIVE_HISA_WS_WARP_OPT (set from
+// decode_select.py; 1 = Phase A warp-aggregated histogram, 2 = Phase B ballot
+// compaction, 4 = Phase C warp-aggregated histogram) so the per-leaf atomic
+// baseline stays available for bit-exact A/B and per-GPU tuning. On H20 the
+// per-leaf shared atomics are already cheaper than __match_any_sync, so the
+// default is 0; see runner/bench_weighted_select.py. Every helper is called
+// by all 32 lanes of a warp with a full mask (the callers iterate in
+// whole-block stripes and fold `index < n` into the predicate), so no lane of
+// the sync mask can be missing.
+#ifndef ADAPTIVE_HISA_WS_WARP_OPT
+#define ADAPTIVE_HISA_WS_WARP_OPT 0
+#endif
+
+constexpr unsigned kFullWarp = 0xffffffffu;
+
+__device__ __forceinline__ uint32_t warp_group_sum_u32(unsigned peer_mask,
+                                                       uint32_t value) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  return __reduce_add_sync(peer_mask, value);
+#else
+  // All peer lanes execute the same shuffle sequence.
+  uint32_t sum = 0;
+  unsigned lanes = peer_mask;
+  while (lanes != 0) {
+    const int src = __ffs(lanes) - 1;
+    sum += __shfl_sync(peer_mask, value, src);
+    lanes &= lanes - 1;
+  }
+  return sum;
+#endif
+}
+
+// histogram[bin] += weight for every valid lane, with one shared atomic per
+// (warp, bin) group instead of one per lane. Integer addition, so the bin
+// totals are identical to the per-lane version.
+__device__ __forceinline__ void warp_aggregated_hist_add(uint32_t *histogram,
+                                                         bool valid, int bin,
+                                                         uint32_t weight) {
+  const unsigned valid_mask = __ballot_sync(kFullWarp, valid);
+  if (!valid) {
+    return;
+  }
+  const unsigned peer_mask = __match_any_sync(valid_mask, bin);
+  const uint32_t group_weight = warp_group_sum_u32(peer_mask, weight);
+  if ((static_cast<int>(threadIdx.x) & 31) == __ffs(peer_mask) - 1) {
+    atomicAdd(&histogram[bin], group_weight);
+  }
+}
+
+// Reserve one slot per matching lane in a shared append buffer with a single
+// atomicAdd per warp; returns the slot (or -1). The physical order of the
+// packed records differs from the per-lane atomic version, which is fine for
+// the threshold bucket: Phase C only reads (weight, index) records and the
+// stable tie order is produced by the final logical scan.
+__device__ __forceinline__ int warp_compact_reserve(bool match,
+                                                    int32_t *global_count) {
+  const unsigned match_mask = __ballot_sync(kFullWarp, match);
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  int base = 0;
+  if (lane == 0 && match_mask != 0u) {
+    base = atomicAdd(global_count, __popc(match_mask));
+  }
+  base = __shfl_sync(kFullWarp, base, 0);
+  if (!match) {
+    return -1;
+  }
+  const unsigned lanes_before = (1u << lane) - 1u;
+  return base + __popc(match_mask & lanes_before);
+}
+
+// Threshold-bin search over a 256-bin weighted histogram, executed by one
+// full warp (8 bins per lane, descending bin order). Returns the highest bin
+// b with sum(hist[b+1..255]) <= remaining < sum(hist[b..255]) and writes the
+// weight strictly above it; -1 when the whole histogram fits. Identical to
+// the single-thread descending scan it replaces, minus ~256 dependent
+// shared-memory round trips on the kernel's critical path.
+__device__ __forceinline__ int warp_threshold_bin(const uint32_t *histogram,
+                                                  uint32_t remaining,
+                                                  uint32_t *above_out) {
+  constexpr int kPerLane = kRadix / 32;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  uint32_t w[kPerLane];
+  uint32_t local = 0;
+#pragma unroll
+  for (int i = 0; i < kPerLane; ++i) {
+    w[i] = histogram[kRadix - 1 - (lane * kPerLane + i)];
+    local += w[i];
+  }
+  uint32_t inclusive = local;
+#pragma unroll
+  for (int offset = 1; offset < 32; offset <<= 1) {
+    const uint32_t up = __shfl_up_sync(kFullWarp, inclusive, offset);
+    if (lane >= offset) {
+      inclusive += up;
+    }
+  }
+  uint32_t above = inclusive - local;
+  int chosen = -1;
+  uint32_t chosen_above = 0;
+#pragma unroll
+  for (int i = 0; i < kPerLane; ++i) {
+    if (chosen < 0 && above + w[i] > remaining) {
+      chosen = kRadix - 1 - (lane * kPerLane + i);
+      chosen_above = above;
+    }
+    above += w[i];
+  }
+  const unsigned found = __ballot_sync(kFullWarp, chosen >= 0);
+  if (found == 0u) {
+    return -1;
+  }
+  const int src = __ffs(found) - 1; // lowest lane holds the highest bins
+  *above_out = __shfl_sync(kFullWarp, chosen_above, src);
+  return __shfl_sync(kFullWarp, chosen, src);
+}
+
 struct Guard {
   int32_t sink_end;
   int32_t tail_start;
@@ -257,6 +374,24 @@ __global__ __launch_bounds__(kThreads) void weighted_prefix_fast_kernel(
   __syncthreads();
 
   // Phase A: exact-FP32 ordered-key high-byte histogram over all leaves.
+#if (ADAPTIVE_HISA_WS_WARP_OPT & 1)
+  // Whole-block stripes keep every lane in the warp intrinsics; `index < n`
+  // is folded into the predicate instead of leaving the loop early.
+  for (int base = 0; base < n; base += kThreads) {
+    const int index = base + tid;
+    int32_t length = 0;
+    uint32_t key = 0;
+    if (index < n) {
+      int32_t first;
+      length = clipped_leaf(starts[index], lengths[index], g, &first);
+      if (length > 0) {
+        key = ordered_float_key(scores[index]);
+      }
+    }
+    warp_aggregated_hist_add(histogram, length > 0, static_cast<int>(key >> 24),
+                             static_cast<uint32_t>(length));
+  }
+#else
   for (int index = tid; index < n; index += kThreads) {
     int32_t first;
     const int32_t length =
@@ -266,26 +401,23 @@ __global__ __launch_bounds__(kThreads) void weighted_prefix_fast_kernel(
       atomicAdd(&histogram[bin], static_cast<uint32_t>(length));
     }
   }
+#endif
   __syncthreads();
 
-  if (tid == 0) {
+  if (tid < 32) {
     uint32_t above = 0;
-    int chosen = -1;
-    for (int bin = kRadix - 1; bin >= 0; --bin) {
-      const uint32_t weight = histogram[bin];
-      if (above + weight > static_cast<uint32_t>(remaining)) {
-        chosen = bin;
+    const int chosen = warp_threshold_bin(
+        histogram, static_cast<uint32_t>(remaining), &above);
+    if (tid == 0) {
+      if (chosen >= 0) {
         remaining -= static_cast<int32_t>(above);
         threshold_byte = chosen;
         threshold_key = static_cast<uint32_t>(chosen) << 24;
         prefix_mask = 0xff000000u;
-        break;
+      } else {
+        // The complete non-guard interval fits in the remaining budget.
+        select_all = 1;
       }
-      above += weight;
-    }
-    // The complete non-guard interval fits in the remaining budget.
-    if (chosen < 0) {
-      select_all = 1;
     }
   }
   __syncthreads();
@@ -294,6 +426,29 @@ __global__ __launch_bounds__(kThreads) void weighted_prefix_fast_kernel(
     // Phase B: second and last full score scan. Pack only leaves in the
     // threshold high-byte bucket; all higher/lower buckets are already
     // resolved and are revisited only by the final logical-order output scan.
+#if (ADAPTIVE_HISA_WS_WARP_OPT & 2)
+    // One candidate_count atomic per warp per stripe (ballot + lane prefix)
+    // instead of one per matching leaf. candidate_count still counts every
+    // matching leaf; only the physical order of the packed records changes.
+    for (int base = 0; base < n; base += kThreads) {
+      const int index = base + tid;
+      int32_t length = 0;
+      bool match = false;
+      if (index < n) {
+        int32_t first;
+        length = clipped_leaf(starts[index], lengths[index], g, &first);
+        match = length > 0 &&
+                static_cast<int32_t>(ordered_float_key(scores[index]) >> 24) ==
+                    threshold_byte;
+      }
+      const int pos = warp_compact_reserve(match, &candidate_count);
+      if (match && pos < kFastMaxLeaves) {
+        threshold_candidates[pos] =
+            (static_cast<uint64_t>(static_cast<uint32_t>(length)) << 32) |
+            static_cast<uint32_t>(index);
+      }
+    }
+#else
     for (int index = tid; index < n; index += kThreads) {
       int32_t first;
       const int32_t length =
@@ -311,6 +466,7 @@ __global__ __launch_bounds__(kThreads) void weighted_prefix_fast_kernel(
         }
       }
     }
+#endif
     __syncthreads();
 
     // Phase C: refine only the packed threshold bucket. The first byte was
@@ -323,6 +479,24 @@ __global__ __launch_bounds__(kThreads) void weighted_prefix_fast_kernel(
       __syncthreads();
 
       const int packed_n = min(candidate_count, kFastMaxLeaves);
+#if (ADAPTIVE_HISA_WS_WARP_OPT & 4)
+      for (int base = 0; base < packed_n; base += kThreads) {
+        const int pos = base + tid;
+        bool valid = false;
+        uint32_t weight = 0;
+        uint32_t key = 0;
+        if (pos < packed_n) {
+          const uint64_t packed = threshold_candidates[pos];
+          const int index = static_cast<int>(static_cast<uint32_t>(packed));
+          weight = static_cast<uint32_t>(packed >> 32);
+          key = ordered_float_key(scores[index]);
+          valid = (key & prefix_mask) == threshold_key;
+        }
+        warp_aggregated_hist_add(histogram, valid,
+                                 static_cast<int>((key >> shift) & 0xffu),
+                                 weight);
+      }
+#else
       for (int pos = tid; pos < packed_n; pos += kThreads) {
         const uint64_t packed = threshold_candidates[pos];
         const int index = static_cast<int>(static_cast<uint32_t>(packed));
@@ -333,24 +507,19 @@ __global__ __launch_bounds__(kThreads) void weighted_prefix_fast_kernel(
           atomicAdd(&histogram[bin], weight);
         }
       }
+#endif
       __syncthreads();
 
-      if (tid == 0) {
+      if (tid < 32) {
         uint32_t above = 0;
-        int chosen = -1;
-        for (int bin = kRadix - 1; bin >= 0; --bin) {
-          const uint32_t weight = histogram[bin];
-          if (above + weight > static_cast<uint32_t>(remaining)) {
-            chosen = bin;
-            remaining -= static_cast<int32_t>(above);
-            const uint32_t byte_mask = 0xffu << shift;
-            threshold_key =
-                (threshold_key & ~byte_mask) |
-                (static_cast<uint32_t>(chosen) << shift);
-            prefix_mask |= byte_mask;
-            break;
-          }
-          above += weight;
+        const int chosen = warp_threshold_bin(
+            histogram, static_cast<uint32_t>(remaining), &above);
+        if (tid == 0 && chosen >= 0) {
+          remaining -= static_cast<int32_t>(above);
+          const uint32_t byte_mask = 0xffu << shift;
+          threshold_key = (threshold_key & ~byte_mask) |
+                          (static_cast<uint32_t>(chosen) << shift);
+          prefix_mask |= byte_mask;
         }
       }
       __syncthreads();
@@ -461,15 +630,31 @@ __global__ void expand_selected_kernel(
 
   // One warp owns each selected leaf interval. This reverses the old
   // 8192-times binary search: intervals write their known output ranges.
-  for (int leaf = warp; leaf < n; leaf += kWarps) {
-    const int32_t previous = leaf > 0 ? selected_prefix[leaf - 1] : 0;
-    const int32_t taken = selected_prefix[leaf] - previous;
-    if (taken > 0) {
-      int32_t first;
-      clipped_leaf(starts[leaf], lengths[leaf], g, &first);
-      const int32_t output = sink_tokens + previous;
-      for (int j = lane; j < taken; j += 32) {
-        candidates[output + j] = first + j;
+  // Each warp inspects 32 leaves per round with coalesced loads (most leaves
+  // are not selected) and then expands the selected ones one at a time via
+  // ballot, instead of one dependent global round trip per leaf per warp.
+  for (int base = warp * 32; base < n; base += kWarps * 32) {
+    const int leaf = base + lane;
+    int32_t taken = 0;
+    int32_t first = 0;
+    int32_t output = 0;
+    if (leaf < n) {
+      const int32_t previous = leaf > 0 ? selected_prefix[leaf - 1] : 0;
+      taken = selected_prefix[leaf] - previous;
+      if (taken > 0) {
+        clipped_leaf(starts[leaf], lengths[leaf], g, &first);
+        output = sink_tokens + previous;
+      }
+    }
+    unsigned pending = __ballot_sync(kFullWarp, taken > 0);
+    while (pending != 0u) {
+      const int src = __ffs(pending) - 1;
+      pending &= pending - 1u;
+      const int32_t s_first = __shfl_sync(kFullWarp, first, src);
+      const int32_t s_taken = __shfl_sync(kFullWarp, taken, src);
+      const int32_t s_output = __shfl_sync(kFullWarp, output, src);
+      for (int j = lane; j < s_taken; j += 32) {
+        candidates[s_output + j] = s_first + j;
       }
     }
   }

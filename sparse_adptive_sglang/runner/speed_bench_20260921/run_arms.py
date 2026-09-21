@@ -72,6 +72,11 @@ ARMS = {
                                   env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
                                        "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048",
                                        "SGLANG_NSA_ADAPTIVE_HISA_TREE_CACHE": "0"}, override=None),
+    # 2026-09-22: + decode selector fast path with warp threshold-bin search and lane-parallel
+    # interval expansion (weighted_select.cu); prefill unchanged vs adaptive_sp_v3.
+    "adaptive_sp_v4": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
+                           env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
+                                "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048"}, override=None),
     "adaptive_sp_df": dict(pythonpath="/workspace/qyl/code/adaptive_0921_h202/python",
                            env={**ADAPTIVE_ENV, "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL": "1",
                                 "SGLANG_NSA_ADAPTIVE_HISA_SPARSE_PREFILL_ROWS": "2048",

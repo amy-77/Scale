@@ -1,4 +1,4 @@
-# Adaptive-HISA 稀疏 Prefill — `adaptive_0921_h202`（代码快照 2026-09-21 23:50）
+# Adaptive-HISA 稀疏 Prefill — `adaptive_0921_h202`（代码快照 2026-09-22 00:40）
 
 来源机器 h20-9-57，目录 `/DATA/disk0/qyl/code/adaptive_0921_h202`。
 基线：https://github.com/xuyufei-a/sglang_hisa 分支 `hisa_pr`，git HEAD `faa198b4e`（`git_head.txt`）；
@@ -57,11 +57,23 @@
 | Top-2048 | `nsa/hisa/hisa_topk_fused.py : hisa_topk_candidates_fused` | 输出 request-relative token id，格式同 `fast_topk_v2(..., row_starts=ks)` |
 | 核心编排 | `prefill_select.py : sparse_topk_core`（可独立测试）、`sparse_prefill_topk`（服务内包装） | 行按 `SPARSE_PREFILL_ROWS` 分批，全程无 `.item()` |
 
-### C. Decode 侧（h201 继承，未改）
+### C. Decode 侧（h201 继承；09-22 选择算子 fast path 提速 2.7×，结果逐位不变）
 
 `nsa/adaptive_hisa/decode_runtime.py : maybe_decode_topk → select_topk`，候选选择 `nsa/adaptive_hisa/decode_select.py : weighted_select_candidates`
 → `nsa/adaptive_hisa/csrc/weighted_select.cu : weighted_prefix_fast_kernel / expand_selected_kernel / expand_intervals_kernel`，
 连续段精排 `nsa/adaptive_hisa/segment_scorer.py : _segment_score_kernel`。
+
+`weighted_prefix_fast_kernel`（单 CTA 1024 线程）：Phase A 全叶 token 加权 FP32 高字节 histogram → Phase B 只打包阈值桶 → Phase C 三轮 radix 细化
+→ 最终按逻辑序扫描输出 `selected_prefix`（稳定 tie、crossing leaf 部分选取）。09-22 改动（参考 `Adaptive_HISA_WeightedSelect_Warp优化_Cursor修改指南.pdf`）：
+
+| 改动 | 代码 | 效果（n=2048 叶，H20） |
+|---|---|---|
+| 找 threshold byte 的单线程 256-bin 倒序扫描（4 次）→ 一个 warp 的 shuffle 前缀 + ballot | `weighted_select.cu : warp_threshold_bin` | prefix kernel 23.6 → 10.1 µs（真正的热点） |
+| `expand_selected_kernel` 每 warp 每轮看 32 个 leaf（合并读）+ ballot 逐区间写 | `weighted_select.cu : expand_selected_kernel` | 15.3 → 8.5 µs，与 n 无关 |
+| PDF 的 warp 聚合 histogram 原子（`__match_any_sync`+`__reduce_add_sync`）与 Phase B ballot 压缩 | `warp_aggregated_hist_add / warp_compact_reserve`，位掩码 `ADAPTIVE_HISA_WS_WARP_OPT`（env `ADAPTIVE_HISA_SELECT_WARP_OPT`，1/2/4 = Phase A/B/C） | 已实现、逐位等价，但 H20 上更慢（A +2.6、C +1.7 µs，B ±0），**默认关** |
+
+整个选择算子（prefix + expand）38.8 → 14.2 µs；端到端 TPOT 19.16 → 18.10 ms（HISA-64 17.85）。
+微基准 `runner/bench_weighted_select.py`（`--scores relu` 为正分数集中分布），逐位单测 `test_adaptive_hisa_decode.py::test_weighted_selector_fast_path_bit_exact_sweep`。
 
 ## 稀疏 prefill 的关键调用链
 
@@ -139,7 +151,8 @@ decode（与 h201 相同）
 | h202 稀疏 prefill（全 chunk 稀疏，argsort 选叶） | 47.13 s | 19.2 ms |
 | h202 + dense final | 50.80 s | 19.2 ms |
 | h202 + weighted radix select（09-21 22:xx） | 46.12 s | 19.3 ms |
-| **h202 + flat 持久化精排 + 增量 SSE 树（09-21 23:xx，当前代码）** | **45.44 s** | 19.2 ms |
+| h202 + flat 持久化精排 + 增量 SSE 树（09-21 23:xx） | 45.44 s | 19.2 ms |
+| **h202 + decode 选择算子 fast path 优化（09-22 00:xx，当前代码）** | **45.33 s** | **18.1 ms** |
 
 128K 最后一个 chunk、每层稀疏 indexer 各阶段（H20）：coarse GEMM 1.3 + 选叶 0.5 + 精排 4.4 + 局部窗口密集 GEMM 2.4 + cat/Top-2048 2.1 ≈ 10.7 ms
 （精排、局部窗口都已到 fp8 算力上限；HISA 自己的 K=64 块 kernel 处理同样 token 反而慢 6%），side stream 上每 chunk 建分区 4.7 ms（merge 8 轮 2.7 ms 占大头）。
