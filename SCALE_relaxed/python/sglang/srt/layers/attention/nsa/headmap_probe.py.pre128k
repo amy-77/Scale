@@ -1,0 +1,138 @@
+"""Opt-in 128K probe comparing shared DSA and per-indexer Top-K on MLA logits."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import torch
+
+_PICKS: dict[int, torch.Tensor] = {}
+_DONE: set[int] = set()
+
+
+def enabled() -> bool:
+    return bool(os.environ.get("SGLANG_NSA_HEADMAP_PROBE_DIR"))
+
+
+def wants_layer(layer_id: int) -> bool:
+    layers = os.environ.get("SGLANG_NSA_HEADMAP_PROBE_LAYERS", "0,30,60")
+    return layer_id in {int(x) for x in layers.split(",") if x}
+
+
+def min_len() -> int:
+    return int(os.environ.get("SGLANG_NSA_HEADMAP_PROBE_MIN_LEN", "120000"))
+
+
+def put_picks(layer_id: int, picks: torch.Tensor) -> None:
+    _PICKS[layer_id] = picks
+
+
+def _stats(x: torch.Tensor) -> dict[str, float]:
+    x = x.float()
+    return {
+        "mean": float(x.mean()),
+        "p10": float(x.quantile(0.10)),
+        "p50": float(x.quantile(0.50)),
+        "p90": float(x.quantile(0.90)),
+        "min": float(x.min()),
+        "max": float(x.max()),
+    }
+
+
+@torch.no_grad()
+def maybe_dump_decode(
+    layer,
+    forward_batch,
+    metadata,
+    q_all: torch.Tensor,  # [1, local_mla_heads, 576]
+    shared_indices: torch.Tensor,  # [1, 2048], request-relative
+) -> None:
+    layer_id = int(layer.layer_id)
+    if (
+        not enabled()
+        or not wants_layer(layer_id)
+        or layer_id in _DONE
+        or q_all.shape[0] != 1
+        or layer_id not in _PICKS
+    ):
+        return
+
+    seq_len = int(forward_batch.seq_lens[0].item())
+    if seq_len < min_len():
+        return
+
+    loc = metadata.page_table_1[0, :seq_len].to(torch.int64)
+    k_nope, k_rope = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+        layer, loc, dst_dtype=torch.bfloat16
+    )
+    key = torch.cat([k_nope.squeeze(1), k_rope.squeeze(1)], dim=-1)
+    logits = torch.matmul(q_all[0].float(), key.float().T) * layer.scaling
+    probs = torch.softmax(logits, dim=-1)
+    n_heads = logits.shape[0]
+
+    shared = shared_indices[0].long()
+    shared = shared[(shared >= 0) & (shared < seq_len)]
+    exact2048 = torch.topk(logits, k=2048, dim=-1).indices
+    exact2048_mask = torch.zeros_like(logits, dtype=torch.bool)
+    exact2048_mask.scatter_(1, exact2048, True)
+    shared_row = shared.view(1, -1).expand(n_heads, -1)
+    shared_recall2048 = (
+        exact2048_mask.gather(1, shared_row).sum(1).float() / 2048
+    )
+    shared_mass = probs.gather(1, shared_row).sum(1)
+
+    picks = _PICKS.pop(layer_id)[0]
+    groups = picks.shape[0]
+    assert n_heads % groups == 0
+    per_head = picks.repeat_interleave(n_heads // groups, dim=0).long()
+    valid = (per_head >= 0) & (per_head < seq_len)
+    gather_idx = per_head.clamp(min=0, max=seq_len - 1)
+    exact720 = torch.topk(logits, k=720, dim=-1).indices
+    exact720_mask = torch.zeros_like(logits, dtype=torch.bool)
+    exact720_mask.scatter_(1, exact720, True)
+    shared_selected_mask = torch.zeros_like(logits, dtype=torch.bool)
+    shared_selected_mask.scatter_(1, shared_row, True)
+    shared_recall720 = shared_selected_mask.gather(1, exact720).sum(1).float() / 720
+    per_head_recall = (
+        (exact720_mask.gather(1, gather_idx) & valid).sum(1).float() / 720
+    )
+    per_head_mass = probs.gather(1, gather_idx).masked_fill(~valid, 0).sum(1)
+
+    try:
+        from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+        rank = get_attention_tp_rank()
+    except Exception:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    record = {
+        "layer": layer_id,
+        "tp_rank": int(rank),
+        "seq_len": seq_len,
+        "local_mla_heads": n_heads,
+        "local_indexer_heads": groups,
+        "shared_top2048": {
+            "mla_top720_recall": _stats(shared_recall720),
+            "mla_top2048_recall": _stats(shared_recall2048),
+            "mla_attention_mass": _stats(shared_mass),
+        },
+        "per_head_top720_fixed_1to2": {
+            "mla_top720_recall": _stats(per_head_recall),
+            "mla_attention_mass": _stats(per_head_mass),
+        },
+        "per_mla_head": {
+            "shared_recall_top720": shared_recall720.cpu().tolist(),
+            "shared_recall_top2048": shared_recall2048.cpu().tolist(),
+            "shared_mass": shared_mass.cpu().tolist(),
+            "per_head_recall": per_head_recall.cpu().tolist(),
+            "per_head_mass": per_head_mass.cpu().tolist(),
+        },
+    }
+    out = Path(os.environ["SGLANG_NSA_HEADMAP_PROBE_DIR"])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"L{layer_id:02d}_rank{rank}.json").write_text(
+        json.dumps(record, indent=2)
+    )
+    _DONE.add(layer_id)
