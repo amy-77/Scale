@@ -1,0 +1,71 @@
+[
+ {
+  "layer": 0,
+  "leaves": 960,
+  "n_complete": 122880,
+  "dense@8192": {
+   "recall_all": 0.2111,
+   "recall_local": 1.0,
+   "local_ref_mean": 88.3,
+   "chunk_ms": 18.821
+  },
+  "block@8192": {
+   "recall_all": 0.1651,
+   "recall_local": 0.4737,
+   "local_ref_mean": 88.3,
+   "chunk_ms": 15.191
+  },
+  "block@12288": {
+   "recall_all": 0.2356,
+   "recall_local": 0.5714,
+   "local_ref_mean": 88.3,
+   "chunk_ms": 20.203
+  }
+ },
+ {
+  "layer": 30,
+  "leaves": 960,
+  "n_complete": 122880,
+  "dense@8192": {
+   "recall_all": 0.8781,
+   "recall_local": 1.0,
+   "local_ref_mean": 1042.6,
+   "chunk_ms": 20.381
+  },
+  "block@8192": {
+   "recall_all": 0.8339,
+   "recall_local": 0.9858,
+   "local_ref_mean": 1042.6,
+   "chunk_ms": 15.957
+  },
+  "block@12288": {
+   "recall_all": 0.8827,
+   "recall_local": 0.9952,
+   "local_ref_mean": 1042.6,
+   "chunk_ms": 22.19
+  }
+ },
+ {
+  "layer": 50,
+  "leaves": 960,
+  "n_complete": 122880,
+  "dense@8192": {
+   "recall_all": 0.7698,
+   "recall_local": 1.0,
+   "local_ref_mean": 857.4,
+   "chunk_ms": 19.849
+  },
+  "block@8192": {
+   "recall_all": 0.7057,
+   "recall_local": 0.9625,
+   "local_ref_mean": 857.4,
+   "chunk_ms": 17.415
+  },
+  "block@12288": {
+   "recall_all": 0.7768,
+   "recall_local": 0.9825,
+   "local_ref_mean": 857.4,
+   "chunk_ms": 22.167
+  }
+ }
+]
