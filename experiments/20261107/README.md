@@ -49,6 +49,7 @@ Create a separate checkout directory and apply the supplied patch there:
 
 ```bash
 cp -a sglang HISA_current
+git -C HISA_current init -q
 git -C HISA_current apply --check ../experiments/20261107/hisa_current.patch
 git -C HISA_current apply ../experiments/20261107/hisa_current.patch
 export HISA_SOURCE="$PWD/HISA_current"

@@ -90,10 +90,12 @@ docker run --rm -it --gpus all --network host --shm-size 64g \
 
 ```bash
 cp -a sglang HISA_current
+git -C HISA_current init -q
 git -C HISA_current apply --check ../experiments/20261107/hisa_current.patch
 git -C HISA_current apply ../experiments/20261107/hisa_current.patch
 ```
 
+`git init` 将复制目录设为独立 Git 根目录，确保补丁路径相对于该目录应用。
 基线补丁已校验：还原后的 Python 源码 2,635 个文件与当前实验快照一致。
 历史仓库含 `README.md` / `readme.md` 同名大小写文件，完整推理环境请使用 Linux
 区分大小写的文件系统。
