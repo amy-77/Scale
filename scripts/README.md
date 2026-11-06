@@ -36,6 +36,43 @@ python scripts/data/download_longbench_v2.py \
 下载缓存自动复用。已有官方 `data.json` 可加 `--input-file /path/to/data.json`。
 `paper401` 按已发布的 ID 清单筛选，不重新随机抽题。
 
+### 401 题具体如何选择
+
+这套数据来自官方 503 题，去掉原数据收集脚本的 `train` 组 96 题和
+`validation` 组 6 题，剩下 **503 − 96 − 6 = 401 题**。
+这里的 `train` / `validation` 是项目内部划分；Hugging Face 上完整的 503 题
+都放在名为 `train` 的官方数据 split 中，两者不是同一个概念。
+
+具体规则沿用 [`select_stratified`](../SCALE_relaxed/runner/evaluators/collect_longbench_v2.py)：
+
+1. 按难度 `easy/hard` × 长度 `short/medium/long` 分成 6 层。
+2. 每层再按 `domain` 分组；每个领域内部按题目 `_id` 的 SHA256 升序排列。
+3. 将领域名排序，按领域轮转取题，得到该层的确定性顺序。
+4. 每层前 16 题划入 `train`，第 17 题划入 `validation`，共排除 17 题。
+5. 从官方全集中去掉这 102 个 ID，保留其余题目的原始顺序。
+
+该规则不读取模型预测、答案正确与否或得分；它也不按实际 token 数是否超过
+128K 来筛题。输入截断属于后续评测配置，与这一步选题无关。
+
+| 难度 | 长度 | 官方全集 | 排除 | 保留 |
+| --- | --- | ---: | ---: | ---: |
+| easy | short | 59 | 17 | 42 |
+| easy | medium | 88 | 17 | 71 |
+| easy | long | 45 | 17 | 28 |
+| hard | short | 121 | 17 | 104 |
+| hard | medium | 127 | 17 | 110 |
+| hard | long | 63 | 17 | 46 |
+| 合计 | | 503 | 102 | 401 |
+
+固定清单及完整排除 ID 见
+[`longbench_heldout_manifest.json`](../experiments/20261107/longbench_heldout_manifest.json)。
+下载脚本会重新计算上述规则，校验 401 个 ID 和顺序，再逐题校验内容 SHA256。
+本次核对得到的集合、顺序和全部 401 条内容均与服务器当前数据一致。
+因此公司电脑执行上面的 `--subset paper401` 命令即可得到相同的评测输入。
+
+历史口径中，`held-out` 特指排除了 `train` 和 `validation`：旧收集脚本另标记的
+6 条 `calibration` 和 6 条 `test` 仍包含在这 401 条中。本脚本保留这一既有口径。
+
 ## 3. 生成 RULER
 
 脚本固定 [NVIDIA/RULER](https://github.com/NVIDIA/RULER) 到原始生成版本

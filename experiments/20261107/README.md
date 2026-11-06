@@ -2,6 +2,9 @@
 
 For dataset preparation and single-configuration runs on another machine, see
 the [quick start](../../scripts/README.md).
+The quick start also documents exactly how the 401-question LongBench subset
+is obtained: exclude the original 96 train and 6 validation IDs from all 503
+records, using the deterministic difficulty/length/domain-stratified selector.
 
 The running SCALE implementation is `SCALE_relaxed/`, configured as relaxed
 global Key-SSE split S8 / merge target M64. It is not the `Root-local/` variant.

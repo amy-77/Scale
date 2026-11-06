@@ -806,5 +806,197 @@
     "66f7c780bb02136c067c35e8": "0cfb03284d53d49c932708c4abe954f310c08d5b4bb5a1453a3c26b7845bc90c",
     "66f2a7a9821e116aacb2a721": "563c8283498544ed3b2a6be16219a4eba316ce3758ce62e9c7ba9f811e12710a"
   },
-  "hash_format": "sha256(json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(comma,colon)).encode(utf-8))"
+  "hash_format": "sha256(json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(comma,colon)).encode(utf-8))",
+  "selection": {
+    "rule": "Official 503 minus original train (96) and validation (6); preserve official input order.",
+    "selector": "SCALE_relaxed/runner/evaluators/collect_longbench_v2.py:select_stratified",
+    "stratum_keys": [
+      "difficulty",
+      "length"
+    ],
+    "within_domain_order": "ascending SHA256(str(_id).encode()).digest()",
+    "domain_order": "ascending domain name, round-robin nonempty domains",
+    "zero_based_offsets": {
+      "train": [
+        0,
+        16
+      ],
+      "validation": [
+        16,
+        17
+      ]
+    },
+    "excluded_count": 102,
+    "excluded_ids": {
+      "train": [
+        "66ead7bd5a08c7b9b35dca7a",
+        "66ebd2475a08c7b9b35e0155",
+        "66ebd34d5a08c7b9b35e035d",
+        "66ebd3ba5a08c7b9b35e0446",
+        "66ebdd1c5a08c7b9b35e113b",
+        "66ebe30a5a08c7b9b35e1693",
+        "66ebf9bf5a08c7b9b35e1f85",
+        "66ec0874821e116aacb194a4",
+        "66ec09ec821e116aacb19620",
+        "66ec17e4821e116aacb1a6a7",
+        "66ec2755821e116aacb1b6f2",
+        "66ec3644821e116aacb1c312",
+        "66ece545821e116aacb1dd77",
+        "66ed2c87821e116aacb1f149",
+        "66ed364d821e116aacb1f47e",
+        "66ed5be2821e116aacb1fb57",
+        "66f19f04821e116aacb27bab",
+        "66f2616e821e116aacb28e0c",
+        "66f26c5f821e116aacb2907c",
+        "66f28794821e116aacb298ee",
+        "66f2982b821e116aacb29c66",
+        "66f2a414821e116aacb2a3af",
+        "66f2a46d821e116aacb2a41a",
+        "66f2a59d821e116aacb2a553",
+        "66f2cb0f821e116aacb2ba6d",
+        "66f2d553821e116aacb2bc8f",
+        "66f37635821e116aacb2d017",
+        "66f37eb9821e116aacb2d295",
+        "66f39ac5821e116aacb2da81",
+        "66f3a311821e116aacb2de19",
+        "66f3ac0b821e116aacb2e203",
+        "66f3ad93821e116aacb2e29f",
+        "66f3c219821e116aacb2eb4e",
+        "66f3cca6821e116aacb2ef7c",
+        "66f3dd59821e116aacb2f6ba",
+        "66f3edfb821e116aacb2fc91",
+        "66f3f947821e116aacb3029b",
+        "66f40b9c821e116aacb30a99",
+        "66f4ce9e821e116aacb31731",
+        "66f530ce821e116aacb32f09",
+        "66f55729821e116aacb3358b",
+        "66f55828821e116aacb3363e",
+        "66f56c9c821e116aacb33a45",
+        "66f578fa821e116aacb33c58",
+        "66f68b33bb02136c067c2303",
+        "66f6909bbb02136c067c2380",
+        "66f6a14dbb02136c067c2453",
+        "66f7f382bb02136c067c3a6c",
+        "66f94f9ebb02136c067c4fde",
+        "66f954a5bb02136c067c511a",
+        "66f97dc3bb02136c067c56c8",
+        "66fa1b54bb02136c067c5df7",
+        "66fa1e4cbb02136c067c5edf",
+        "66fa2734bb02136c067c627a",
+        "66fa542bbb02136c067c686d",
+        "66fa5fbcbb02136c067c6959",
+        "66fa700bbb02136c067c6c06",
+        "66fa788abb02136c067c6d75",
+        "66fab4bfbb02136c067c754c",
+        "66fad00bbb02136c067c76ce",
+        "66fcf2f2bb02136c067c9169",
+        "66fcfa1cbb02136c067c932e",
+        "66fcfb5fbb02136c067c93ae",
+        "66fcffd9bb02136c067c94c5",
+        "66fea153bb02136c067ca3e7",
+        "6700d19dbb02136c067cb024",
+        "6703a0ecbb02136c067cd11b",
+        "67041f08bb02136c067cdb52",
+        "67062a63bb02136c067cf5ac",
+        "6707b84cbb02136c067d10a5",
+        "670c090bbb02136c067d2404",
+        "670cb73fbb02136c067d2502",
+        "670cf52abb02136c067d2728",
+        "670fbae0bb02136c067d2c79",
+        "670fbb78bb02136c067d2cd3",
+        "67189156bb02136c067d3b8d",
+        "6719185cbb02136c067d40ab",
+        "6719b96abb02136c067d4358",
+        "671a4444bb02136c067d4a40",
+        "671b13f5bb02136c067d4ee3",
+        "671b1480bb02136c067d4f14",
+        "671b2b57bb02136c067d508b",
+        "671b2c05bb02136c067d50c8",
+        "671b2e2dbb02136c067d515b",
+        "671b3d1bbb02136c067d5283",
+        "671b58e8bb02136c067d5525",
+        "671b5d49bb02136c067d55fb",
+        "67237d8ebb02136c067d6c06",
+        "67239fd9bb02136c067d6ff7",
+        "672494e5bb02136c067d7697",
+        "67249705bb02136c067d76d1",
+        "6724c5febb02136c067d78e7",
+        "6724c83fbb02136c067d7962",
+        "6724cae7bb02136c067d79be",
+        "6725d8dbbb02136c067d8309",
+        "6725dc6abb02136c067d8586"
+      ],
+      "validation": [
+        "66ed3ae5821e116aacb1f729",
+        "66f67c18bb02136c067c21b8",
+        "66f6b623bb02136c067c2646",
+        "66fcf725bb02136c067c924a",
+        "66fcfc9fbb02136c067c9411",
+        "670fb637bb02136c067d2b65"
+      ]
+    },
+    "strata": [
+      {
+        "difficulty": "easy",
+        "length": "short",
+        "official": 59,
+        "excluded": 17,
+        "retained": 42
+      },
+      {
+        "difficulty": "easy",
+        "length": "medium",
+        "official": 88,
+        "excluded": 17,
+        "retained": 71
+      },
+      {
+        "difficulty": "easy",
+        "length": "long",
+        "official": 45,
+        "excluded": 17,
+        "retained": 28
+      },
+      {
+        "difficulty": "hard",
+        "length": "short",
+        "official": 121,
+        "excluded": 17,
+        "retained": 104
+      },
+      {
+        "difficulty": "hard",
+        "length": "medium",
+        "official": 127,
+        "excluded": 17,
+        "retained": 110
+      },
+      {
+        "difficulty": "hard",
+        "length": "long",
+        "official": 63,
+        "excluded": 17,
+        "retained": 46
+      }
+    ],
+    "original_calibration_ids_retained": [
+      "66fa0d88bb02136c067c5a8a",
+      "66fa50acbb02136c067c6827",
+      "66fb6527bb02136c067c7b4f",
+      "66fcf36fbb02136c067c919e",
+      "67246413bb02136c067d7374",
+      "67286698bb02136c067d9223"
+    ],
+    "original_test_ids_retained": [
+      "66ebc04a5a08c7b9b35de740",
+      "66ece358821e116aacb1dc08",
+      "66ed24c5821e116aacb1eee6",
+      "66f2e874821e116aacb2c0af",
+      "66f9625fbb02136c067c5456",
+      "67039cfabb02136c067cd04e"
+    ],
+    "reads_model_predictions_or_scores": false,
+    "retained_order": "original official dataset order",
+    "verification": "Recomputed IDs/order equal the frozen server manifest; all 401 canonical record hashes match the pinned official dataset."
+  }
 }

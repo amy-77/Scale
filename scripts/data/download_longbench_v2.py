@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from common import download, hf_endpoint, record_hash, sha256, write_json
@@ -12,6 +13,28 @@ REPO = Path(__file__).resolve().parents[2]
 DATASET = 'zai-org/LongBench-v2'  # Official THUDM/LongBench-v2 URL redirects here.
 REVISION = '2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9'
 FIELDS = {'_id', 'context', 'question', 'choice_A', 'choice_B', 'choice_C', 'choice_D', 'answer', 'domain', 'sub_domain', 'length', 'difficulty'}
+
+
+def verify_paper_rule(rows: list[dict], spec: dict) -> None:
+    """Recompute the original 503 - 96 train - 6 validation selection."""
+    if len(rows) != 503:
+        raise ValueError('Reconstructing paper401 requires the full official 503 records')
+    sys.path.insert(0, str(REPO/'SCALE_relaxed/runner/evaluators'))
+    from collect_longbench_v2 import select_stratified
+
+    excluded = {
+        split: {str(row['_id']) for row in select_stratified(rows, split)}
+        for split in ('train', 'validation')
+    }
+    if len(excluded['train']) != 96 or len(excluded['validation']) != 6:
+        raise ValueError('Unexpected original train/validation split sizes')
+    excluded_ids = excluded['train'] | excluded['validation']
+    expected_ids = [str(row['_id']) for row in rows if str(row['_id']) not in excluded_ids]
+    if len(excluded_ids) != 102 or expected_ids != spec['ids']:
+        raise ValueError('Original selection rule does not reproduce the frozen paper401 IDs/order')
+    recorded = spec.get('selection', {}).get('excluded_ids')
+    if recorded is not None and recorded != {k: sorted(v) for k, v in excluded.items()}:
+        raise ValueError('Recorded exclusion IDs disagree with the original selector')
 
 
 def select(rows: list[dict], subset: str, manifest: Path) -> list[dict]:
@@ -26,6 +49,7 @@ def select(rows: list[dict], subset: str, manifest: Path) -> list[dict]:
             raise ValueError(f'Expected the pinned official 503 records, got {len(rows)}')
         return rows
     spec = json.loads(manifest.read_text())
+    verify_paper_rule(rows, spec)
     selected = []
     for ident in spec['ids']:
         if ident not in by_id:
@@ -60,6 +84,7 @@ def main() -> None:
         'examples': len(selected), 'source_sha256': sha256(source),
         'output_sha256': sha256(args.output),
         'paper_records_verified': args.subset == 'paper401',
+        'paper_selection_rule_verified': args.subset == 'paper401',
     })
     print(f'Wrote {len(selected)} records to {args.output}')
 
