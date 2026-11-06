@@ -1,0 +1,123 @@
+--- a/python/sglang/srt/layers/attention/nsa/hisa/triton_kernels.py
++++ b/python/sglang/srt/layers/attention/nsa/hisa/triton_kernels.py
+@@ -409,7 +409,7 @@
+ #     BlockTables:  [B, max_blocks]                  i32
+ #     Logits:       [B, seq_len, topk * kv_block_size] f32  OUT
+ #
+-#   Single grouped kernel for K∈{8,16,32,64,128}: per-row paged lookup
++#   Single grouped kernel for K∈{4,8,16,32,64,128}: per-row paged lookup
+ #   (logical_page = token_abs // PAGED) handles K<paged, K==paged, K>paged
+ #   uniformly. GEMM_TILE = max(paged, K) per CTA.
+ # ---------------------------------------------------------------------------
+@@ -586,7 +586,7 @@
+     """Triton equivalent of ``fp8_native_paged_block_sparse_mqa_attn_return_logits_interface``.
+     Returns logits of shape ``[B, seq, topk * kv_block_size]`` f32.
+ 
+-    Unified grouped dispatch for K∈{8,16,32,64,128}. The grouped kernel's
++    Unified grouped dispatch for K∈{4,8,16,32,64,128}. The grouped kernel's
+     per-row paged lookup (``logical_page = token_abs // PAGED``) handles all
+     K layouts uniformly:
+       K<paged (8/16/32):   GROUP_SIZE=64/K, GEMM_TILE=64 — G consecutive
+@@ -608,9 +608,9 @@
+     assert topk_block_index.dtype in (torch.int32, torch.int64)
+     assert context_lens.dtype == torch.int32
+     assert block_tables.dtype == torch.int32
+-    assert kv_block_size in (8, 16, 32, 64, 128), (
++    assert kv_block_size in (4, 8, 16, 32, 64, 128), (
+         f"unsupported kv_block_size={kv_block_size}; expected one of "
+-        "{8,16,32,64,128}"
++        "{4,8,16,32,64,128}"
+     )
+ 
+     # Views (no data copy).
+@@ -1003,7 +1003,7 @@
+     cu_seqlen_ke: torch.Tensor,  # [seq] i32
+ ) -> torch.Tensor:
+     """Block-sparse MQA for ragged prefill. Supports kv_block_size in
+-    {8, 16, 32, 64, 128}.
++    {4, 8, 16, 32, 64, 128}.
+ 
+     Dispatch:
+       kv_block_size >= 64 → original kernel; CTA per (seq, topk*sub) with
+@@ -1012,9 +1012,9 @@
+         topk indices fuse into one [64,D] GEMM tile via row-gather.
+     """
+     assert q_fp8.ndim == 3
+-    assert kv_block_size in (8, 16, 32, 64, 128), (
++    assert kv_block_size in (4, 8, 16, 32, 64, 128), (
+         f"unsupported kv_block_size={kv_block_size}; expected one of "
+-        "{8,16,32,64,128}"
++        "{4,8,16,32,64,128}"
+     )
+     seq_len, H, D = q_fp8.shape
+     seq_kv = k_fp8.shape[0]
+@@ -1030,6 +1030,7 @@
+         # K=8 K_CHUNKS=32 (not 64): KC=64 catastrophically regressed at
+         # block_topk≤256 (constexpr loop runs full 64 iters, half masked).
+         # KC=32 wins universally across block_topk ∈ {256,512,1024,2048}.
++        4: (16, 32, 4, 2),
+         8: (8, 32, 4, 2),
+         16: (16, 32, 8, 3),
+         32: (8, 32, 8, 3),
+@@ -1466,7 +1467,7 @@
+     k_block_size: int,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Mean-pool from paged KV cache. Supports k_block_size in
+-    {8,16,32,64,128}.
++    {4,8,16,32,64,128}.
+ 
+     Dispatch:
+       k_block_size >= paged_block_size (= 64) → original kernel; one CTA
+@@ -1475,8 +1476,8 @@
+         per (b, page) handling GROUP_SIZE = 64/k pool blocks from a
+         single paged page (single page load + per-block reshape).
+     """
+-    assert k_block_size in (8, 16, 32, 64, 128), (
+-        f"unsupported k_block_size={k_block_size}; expected one of " "{8,16,32,64,128}"
++    assert k_block_size in (4, 8, 16, 32, 64, 128), (
++        f"unsupported k_block_size={k_block_size}; expected one of " "{4,8,16,32,64,128}"
+     )
+     num_phys, paged_block_size, head, DPlus4 = kv_cache.shape
+     assert head == 1
+@@ -1715,7 +1716,7 @@
+     k_block_size: int,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Mean-pool fp8 K into k_block_size-token blocks. Supports
+-    k_block_size in {8, 16, 32, 64, 128}.
++    k_block_size in {4, 8, 16, 32, 64, 128}.
+ 
+     Dispatch:
+       k_block_size >= 64 → original kernel (chunked load BLOCK_N=64, the
+@@ -1724,8 +1725,8 @@
+         per CTA; one [64, D] coalesced load + per-block reshape/reduce.
+         Avoids loading sub-64-row tiles.
+     """
+-    assert k_block_size in (8, 16, 32, 64, 128), (
+-        f"unsupported k_block_size={k_block_size}; expected one of " "{8,16,32,64,128}"
++    assert k_block_size in (4, 8, 16, 32, 64, 128), (
++        f"unsupported k_block_size={k_block_size}; expected one of " "{4,8,16,32,64,128}"
+     )
+     seq_kv, D = k_fp8.shape
+     max_num_pool = (seq_kv + k_block_size - 1) // k_block_size
+@@ -2110,7 +2111,7 @@
+     pool_page_size: int,
+ ) -> None:
+     """Triton equivalent of ``fp8_native_paged_mean_pooling_tail_only_interface``."""
+-    assert k_block_size in (8, 16, 32, 64, 128)
++    assert k_block_size in (4, 8, 16, 32, 64, 128)
+     num_phys, page_bytes = kv_cache_flat.shape
+     DPlus4 = page_bytes // paged_block_size
+     D = DPlus4 - 4
+@@ -2171,10 +2172,10 @@
+ ) -> None:
+     """Triton equivalent of ``fp8_native_paged_mean_pooling_completed_blocks_interface``.
+ 
+-    Supports k_block_size in {8, 16, 32, 64, 128}. Layout assumptions:
++    Supports k_block_size in {4, 8, 16, 32, 64, 128}. Layout assumptions:
+     same SoA byte layout as production (fp8 then scales per page).
+     """
+-    assert k_block_size in (8, 16, 32, 64, 128)
++    assert k_block_size in (4, 8, 16, 32, 64, 128)
+     num_phys, page_bytes = kv_cache_flat.shape
+     DPlus4 = page_bytes // paged_block_size
+     D = DPlus4 - 4

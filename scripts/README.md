@@ -132,6 +132,20 @@ git -C HISA_current apply --check ../experiments/20261107/hisa_current.patch
 git -C HISA_current apply ../experiments/20261107/hisa_current.patch
 ```
 
+如需 4-token 固定块，继续应用小粒度扩展：
+
+```bash
+git -C HISA_current apply --check ../experiments/20261107/hisa_block4.patch
+git -C HISA_current apply ../experiments/20261107/hisa_block4.patch
+python scripts/experiments/validate_hisa_fine_blocks.py --hisa-source HISA_current
+```
+
+该补丁扩展现有 grouped Triton 路径到 K=4，并增加对应的调度配置；K=8/16 的
+计算路径保持不变。H20 上已通过 36 项 GPU 参考检查（池化、非连续物理页访问、
+尾块、Top-k）；完整 4-token 端到端精度结果仍须等待评测完成。
+SCALE 需要 `tilelang==0.1.11` 和 `apache-tvm-ffi==0.1.11`：0.1.9 在当前代码的
+增量摘要内核编译时会失败。Docker 配方已固定这两个版本。
+
 `git init` 将复制目录设为独立 Git 根目录，确保补丁路径相对于该目录应用。
 基线补丁已校验：还原后的 Python 源码 2,635 个文件与当前实验快照一致。
 历史仓库含 `README.md` / `readme.md` 同名大小写文件，完整推理环境请使用 Linux
@@ -162,7 +176,15 @@ python scripts/experiments/run_experiment.py \
   --output results/hisa16_no_dense_ruler --resume
 ```
 
-`--hisa-block 8` 对应更细固定块，`--method dsa` 使用原始 DSA 路径。
+细粒度对比使用 `--hisa-block 4/8/16`（K=4 先应用上面的补丁）。
+SCALE 对应 `--scale-average 4/8/16`，默认中间 split divisor 分别为 1/1/2；
+64/128 的默认 split divisor 都为 8。可用 `--scale-split` 明确指定并记入配置。
+SCALE 的 average 是目标平均区间长度，并非固定块长度。
+
+两种方法必须统一 `--dense-final`、候选预算、数据及生成参数。当前新增成对队列
+统一 `--dense-final 1`；此前的 `dense-final 0` 结果单列，不能混成同协议比较。
+先完成同候选预算的质量–速度点，再根据实测延迟补预算扫描；相同候选预算不等于
+相同延迟。`--method dsa` 使用原始 DSA 路径。
 `--tp`、`--port`、`--mem-fraction` 可调整；默认分别是 8、31946、0.82。
 `--dry-run` 只打印命令。已有服务可加 `--server http://127.0.0.1:31946`；此时
 脚本不修改已有服务配置，调用者应核对其算法/模型，实际 server info 会保存到结果目录。

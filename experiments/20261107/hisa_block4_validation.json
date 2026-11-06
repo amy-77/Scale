@@ -1,0 +1,261 @@
+{
+  "passed": true,
+  "gpu": "NVIDIA H20-3e",
+  "checks": [
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 4,
+      "n": 7,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 4,
+      "n": 7,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 4,
+      "n": 63,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 4,
+      "n": 63,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 4,
+      "n": 64,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 4,
+      "n": 64,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 4,
+      "n": 65,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 4,
+      "n": 65,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 4,
+      "n": 257,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 4,
+      "n": 257,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "sparse_logits_against_torch",
+      "block": 4,
+      "ragged_and_permuted_pages": true,
+      "partial_block": true,
+      "nonmultiple_topk": 19
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 8,
+      "n": 7,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 8,
+      "n": 7,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 8,
+      "n": 63,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 8,
+      "n": 63,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 8,
+      "n": 64,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 8,
+      "n": 64,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 8,
+      "n": 65,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 8,
+      "n": 65,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 8,
+      "n": 257,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 8,
+      "n": 257,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "sparse_logits_against_torch",
+      "block": 8,
+      "ragged_and_permuted_pages": true,
+      "partial_block": true,
+      "nonmultiple_topk": 19
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 16,
+      "n": 7,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 16,
+      "n": 7,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 16,
+      "n": 63,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 16,
+      "n": 63,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 16,
+      "n": 64,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 16,
+      "n": 64,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 16,
+      "n": 65,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 16,
+      "n": 65,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "triton",
+      "block": 16,
+      "n": 257,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "pool",
+      "backend": "tilelang",
+      "block": 16,
+      "n": 257,
+      "max_quantized_error": 0.0
+    },
+    {
+      "check": "sparse_logits_against_torch",
+      "block": 16,
+      "ragged_and_permuted_pages": true,
+      "partial_block": true,
+      "nonmultiple_topk": 19
+    },
+    {
+      "check": "topk_exact_against_torch",
+      "k": 512
+    },
+    {
+      "check": "topk_exact_against_torch",
+      "k": 1024
+    },
+    {
+      "check": "topk_exact_against_torch",
+      "k": 2048
+    }
+  ],
+  "patch": {
+    "path": "python/sglang/srt/layers/attention/nsa/hisa/triton_kernels.py",
+    "original_sha256": "43bd1c8d5b42e6f937c730772d96e32d9fff5db785ac0d835dd79832c22e7dcf",
+    "patched_sha256": "9a41ace08c537bb9b66fff4278d1ce77a883d173703ee2d0a95c0fdfe992a1e3",
+    "change": "Extend existing grouped Triton paths to K=4; add K=4 persistent GEMM schedule with 16 groups/64 token tile. K=8/16 schedules unchanged."
+  },
+  "environment": {
+    "torch": "2.11.0+cu130",
+    "tilelang": "0.1.11",
+    "apache-tvm-ffi": "0.1.11",
+    "triton": "3.6.0"
+  }
+}

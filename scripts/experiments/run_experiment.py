@@ -28,8 +28,9 @@ def main() -> None:
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--hisa-source', type=Path, default=REPO/'HISA_current')
     parser.add_argument('--dense-final', type=int, choices=[0, 1], default=0)
-    parser.add_argument('--hisa-block', type=int, choices=[8, 16, 32, 64, 128], default=64)
-    parser.add_argument('--scale-average', type=int, choices=[8, 16, 32, 64, 128], default=64)
+    parser.add_argument('--hisa-block', type=int, choices=[4, 8, 16, 32, 64, 128], default=64)
+    parser.add_argument('--scale-average', type=int, choices=[4, 8, 16, 32, 64, 128], default=64)
+    parser.add_argument('--scale-split', type=int, help='Intermediate split divisor; default min(8, max(1, average//8))')
     parser.add_argument('--candidate-tokens', type=int, default=8192)
     parser.add_argument('--tp', type=int, default=8)
     parser.add_argument('--port', type=int, default=31946)
@@ -43,6 +44,10 @@ def main() -> None:
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
+    if args.scale_split is None:
+        args.scale_split = min(8, max(1, args.scale_average // 8))
+    if args.scale_split < 1 or 256 % args.scale_split or args.scale_split > args.scale_average:
+        parser.error('scale-split must divide 256 and be no greater than scale-average')
     if args.method == 'dsa' and args.dense_final:
         parser.error('dense-final is a hierarchical-indexer ablation; use --dense-final 0 for DSA')
     if args.tp <= 0 or not 0 < args.mem_fraction < 1:
@@ -58,6 +63,7 @@ def main() -> None:
     source = REPO/'SCALE_relaxed' if args.method == 'scale' else args.hisa_source
     env_updates = scale_env(bool(args.dense_final)) if args.method == 'scale' else hisa_env(bool(args.dense_final))
     if args.method == 'scale':
+        env_updates['SGLANG_NSA_ADAPTIVE_HISA_SUMMARY_COMPRESSION'] = str(args.scale_split)
         env_updates['SGLANG_NSA_ADAPTIVE_HISA_MERGE_TARGET_DIVISOR'] = str(args.scale_average)
         env_updates['SGLANG_NSA_ADAPTIVE_HISA_CANDIDATE_TOKENS'] = str(args.candidate_tokens)
     override = {'use_hisa':False} if args.method == 'dsa' else None

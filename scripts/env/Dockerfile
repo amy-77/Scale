@@ -9,7 +9,7 @@ RUN python -m pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
 RUN python -m pip install --index-url ${PIP_INDEX_URL} \
       sglang-kernel==0.4.2.post1 sgl-deep-gemm==0.1.4.post1 \
       flashinfer-python==0.6.13 flashinfer-cubin==0.6.13 \
-      transformers==5.12.1 numpy==1.26.4 \
+      transformers==5.12.1 numpy==1.26.4 tilelang==0.1.11 apache-tvm-ffi==0.1.11 \
       'cuda-toolkit[nvcc,cccl,crt,nvvm]==13.0.2'
 COPY scripts/env/fix_cuda_layout.py /opt/scale/fix_cuda_layout.py
 RUN python /opt/scale/fix_cuda_layout.py
