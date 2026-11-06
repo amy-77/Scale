@@ -1,0 +1,153 @@
+{
+  "examples": 364,
+  "tasks": 13,
+  "lengths": [
+    "32k",
+    "128k"
+  ],
+  "examples_per_task_length": 14,
+  "files": [
+    {
+      "path": "128k/cwe/validation.jsonl",
+      "examples": 14,
+      "sha256": "768032b05b53d92261c28ac8f072daab7b1b083de30341311e91b46cb424945d"
+    },
+    {
+      "path": "128k/fwe/validation.jsonl",
+      "examples": 14,
+      "sha256": "d5b657f4d2ab655c4728d5df1ea4e467a8ff9a3f83c38990a6fb0c4af8762e77"
+    },
+    {
+      "path": "128k/niah_multikey_1/validation.jsonl",
+      "examples": 14,
+      "sha256": "53f3c3a9f121de374de8ddb3e491f059df7c58e2521614be287955efbca2e305"
+    },
+    {
+      "path": "128k/niah_multikey_2/validation.jsonl",
+      "examples": 14,
+      "sha256": "da8d6a771434594a76f4bf855f6cc262acc78a25d1dad63c9b05d14032ef7a79"
+    },
+    {
+      "path": "128k/niah_multikey_3/validation.jsonl",
+      "examples": 14,
+      "sha256": "c802d96bc427db29a84c5e8ede21aee3be165e75bbdebefbb8346570d4d56535"
+    },
+    {
+      "path": "128k/niah_multiquery/validation.jsonl",
+      "examples": 14,
+      "sha256": "fb4d78a21bccf0d5f61cd2a9dd550f8bdb53bc6001427dc2b55ee6a4bbbc0b80"
+    },
+    {
+      "path": "128k/niah_multivalue/validation.jsonl",
+      "examples": 14,
+      "sha256": "36a95707da783172f50f11d26bd0094a18a38d31eb044fe39812c6da8ca7070e"
+    },
+    {
+      "path": "128k/niah_single_1/validation.jsonl",
+      "examples": 14,
+      "sha256": "cfa93f51f18ca7642f3924769420e211828555de81833d2375e4ed200701d608"
+    },
+    {
+      "path": "128k/niah_single_2/validation.jsonl",
+      "examples": 14,
+      "sha256": "72a4b7ccbc45946e87dbeee89ac667260229538a082ce947f4cfe12ef94ad19a"
+    },
+    {
+      "path": "128k/niah_single_3/validation.jsonl",
+      "examples": 14,
+      "sha256": "f4e685827b255d1abc8ae98df325a03a75a527bc75681461d34abec1b927ac39"
+    },
+    {
+      "path": "128k/qa_1/validation.jsonl",
+      "examples": 14,
+      "sha256": "de6146fde656ccc1f928d6c066c9c8f3b0591dd81942eb61867de5406f5eb8f6"
+    },
+    {
+      "path": "128k/qa_2/validation.jsonl",
+      "examples": 14,
+      "sha256": "74c2b67a9e482cfa2f4087a175c7e3d43c0b2c2ec41911c9439722c65a89728e"
+    },
+    {
+      "path": "128k/vt/validation.jsonl",
+      "examples": 14,
+      "sha256": "9446f28cc61cb595ce030b03b51cd7f1ee29f16283097a3d75da03ddc2650a1f"
+    },
+    {
+      "path": "32k/cwe/validation.jsonl",
+      "examples": 14,
+      "sha256": "1c3c49e84a75c9b455bb334e2489058fbcb9433e9169353ee02535746a554025"
+    },
+    {
+      "path": "32k/fwe/validation.jsonl",
+      "examples": 14,
+      "sha256": "0abe6d47f10e92103e34b8613cf2ef7c09f13e768feffc196e86be7b61ba7f6a"
+    },
+    {
+      "path": "32k/niah_multikey_1/validation.jsonl",
+      "examples": 14,
+      "sha256": "8f0e3195c36a588e166f9827f077dcf52a6980d5f4e0d8df1b541ffa10406947"
+    },
+    {
+      "path": "32k/niah_multikey_2/validation.jsonl",
+      "examples": 14,
+      "sha256": "5fac63e47b360490cba10ede91e9704f4d6e2b16286ac1fbb18590f07182cd4e"
+    },
+    {
+      "path": "32k/niah_multikey_3/validation.jsonl",
+      "examples": 14,
+      "sha256": "60a2b8f55a71c106bc6c7c5a1113e556e0b2bf0e766069181f020153c220fee8"
+    },
+    {
+      "path": "32k/niah_multiquery/validation.jsonl",
+      "examples": 14,
+      "sha256": "3066b1c2f62893093553a44db1d81528197bb045323bbbbe9548b0cf316429fc"
+    },
+    {
+      "path": "32k/niah_multivalue/validation.jsonl",
+      "examples": 14,
+      "sha256": "a6d1c25d5850273951d727eb1c4c382c3dadcc4a5e1fba519b90093dbc8b6da7"
+    },
+    {
+      "path": "32k/niah_single_1/validation.jsonl",
+      "examples": 14,
+      "sha256": "83c91d6172fe3fe37d9fa88503677399f8933311670950b4c6518805216374b6"
+    },
+    {
+      "path": "32k/niah_single_2/validation.jsonl",
+      "examples": 14,
+      "sha256": "55ac706322638b5d1de7526c43c36da91bc8810709dfd364ed96768abcaaf8dd"
+    },
+    {
+      "path": "32k/niah_single_3/validation.jsonl",
+      "examples": 14,
+      "sha256": "b69751e5286382cba4766df898e594cc8c9a1f72936bde2f27f899634e93590f"
+    },
+    {
+      "path": "32k/qa_1/validation.jsonl",
+      "examples": 14,
+      "sha256": "8a135d535e4ec8023c2162ce77924d2e5215bb2046aeaa8febf398871f28e7a0"
+    },
+    {
+      "path": "32k/qa_2/validation.jsonl",
+      "examples": 14,
+      "sha256": "96a252b563b0dc83c11dcb1d229b0cd8f593888d3a9fbcf73880dcf19e252924"
+    },
+    {
+      "path": "32k/vt/validation.jsonl",
+      "examples": 14,
+      "sha256": "202d0a3ac105c20f920acf897d8686f96c3e8014b6c55ca2f2b09155ffae432e"
+    }
+  ],
+  "generation_seed": 20260823,
+  "scope": "Frozen paper subset; all records in these files, not a full large-sample RULER run.",
+  "generator_revision": "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a",
+  "generator": "NVIDIA/RULER",
+  "tokenizer": "DeepSeek-V3.2",
+  "selection": "Generate 20 per task/length and retain zero-based rows [6:20]. All 26 frozen files verified byte-for-byte against this slice.",
+  "source_corpus_sha256": {
+    "english_words.json": "affcd6d45fdf3cc843d585c99c97ad615094e760e6c4756b654bab6c73bc2eca",
+    "squad.json": "80a5225e94905956a6446d296ca1093975c4d3b3260f1d6c8f68bc2ab77182d8",
+    "hotpotqa.json": "e3da074df24e8369009918aa5cdbdd254dadcde4c63f7569d36afd6f2268caa8",
+    "PaulGrahamEssays.json": "8d31e1b660e0f2180bcca6d238e18f77921df9d158611582b860da1762b6d3dd"
+  }
+}

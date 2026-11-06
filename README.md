@@ -1,5 +1,21 @@
 # Scale — Adaptive-HISA P-key Split / Merge 算子
 
+## 当前实验版本（2026-11-07）
+
+当前 DeepSeek-V3.2 实验使用 **`SCALE_relaxed/` 的 S8/M64 配置**。
+GitHub 原提交 `70b5a2c` 与服务器提交 `b3106dc` 的已提交文件树完全一致；
+本次补充实验 runner、评测器、HISA 基线补丁和可核对的配置记录。
+运行方式与版本证据见 [当前实验说明](experiments/20261107/README.md)。
+在新机器准备数据、环境并运行实验，请从 [运行指南](scripts/README.md) 开始。
+
+`SCALE_relaxed/runner/deliverable_speed.env` 是历史 S32/M128 速度配置；
+本次 S8/M64 使用 [scale_s8_m64.env](experiments/20261107/scale_s8_m64.env)。
+dense-final 开关需要单独注明，不能把不同策略的质量差值全部归因于分区算法。
+
+以下章节保留早期顶层算子快照的说明；完整 serving 实现位于 `SCALE_relaxed/` 等目录。
+
+---
+
 这个仓库是 Adaptive-HISA(DeepSeek-V3.2 DSA 稀疏注意力上的自适应 KV chunk 划分)中
 **Split / Merge 算子**以及 **Decode 选择算子**的代码快照,从 SGLang 集成分支
 `adaptive_0921_h201` 中抽出,目录扁平化。仓库只包含算子和参考实现,不包含 SGLang

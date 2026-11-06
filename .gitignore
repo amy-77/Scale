@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+
+# Local datasets, models, environments and experiment outputs.
+/data/
+/models/
+/results/
+/third_party/
+/HISA_current/
+/.venv*/
+*.safetensors
+*.log

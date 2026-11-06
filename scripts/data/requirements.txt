@@ -1,0 +1,15 @@
+# Data preparation only; install in a separate environment from GPU serving.
+transformers==4.44.2
+tokenizers==0.19.1
+huggingface-hub>=0.23.2,<1
+requests>=2.32,<3
+certifi
+numpy==1.26.4
+scipy==1.14.1
+PyYAML>=6,<7
+nltk==3.9.1
+wonderwords==3.0.1
+tenacity>=8,<10
+html2text
+beautifulsoup4
+tqdm
